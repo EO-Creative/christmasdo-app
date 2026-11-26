@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { getCapacityStatus, sortVenuesBySuitability } from "./venue-utils";
+import { ResultsMap } from "./ResultsMap";
+import type { VenueType as MapVenueType } from "./map-utils";
 import "./App.css";
 
 type VenueType = "activities" | "food" | "drinks";
@@ -123,6 +125,7 @@ function App() {
 	const [groupSize, setGroupSize] = useState("10");
 	const [searchedGroupSize, setSearchedGroupSize] = useState(10);
 	const [searchedLocation, setSearchedLocation] = useState("");
+	const [searchedCoordinates, setSearchedCoordinates] = useState<{ lat: number; lon: number }>();
 	const [searchedRadiusKm, setSearchedRadiusKm] = useState(5);
 	const [searchedTypes, setSearchedTypes] = useState<VenueType[]>([]);
 	const [types, setTypes] = useState({ activities: false, food: false, drinks: false });
@@ -136,6 +139,7 @@ function App() {
 	const [copied, setCopied] = useState(false);
 	const [loading, setLoading] = useState(false);
 	const [hasSearched, setHasSearched] = useState(false);
+	const [resultsView, setResultsView] = useState<"list" | "map">("list");
 	const [error, setError] = useState("");
 	const [shareError, setShareError] = useState("");
 
@@ -152,6 +156,7 @@ function App() {
 		setGroupSize(String(snapshot.groupSize));
 		setSearchedGroupSize(snapshot.groupSize);
 		setSearchedLocation(snapshot.location.label);
+		setSearchedCoordinates({ lat: snapshot.location.lat, lon: snapshot.location.lon });
 		setSearchedRadiusKm(snapshot.radiusKm);
 		setSearchedTypes(snapshot.types);
 		setRadiusKm(snapshot.radiusKm);
@@ -339,6 +344,7 @@ function App() {
 			setResults(groupedResults);
 			setLocation(place.label);
 			setSelectedLocation(place);
+			setSearchedCoordinates({ lat, lon });
 			const snapshot: SearchSnapshot = {
 				location: { label: place.label, lat, lon },
 				groupSize: requestedGroupSize,
@@ -372,6 +378,9 @@ function App() {
 
 	const selectedLabels = searchedTypes.map((type) => venueTypeLabels[type]);
 	const allResults = venueTypes.flatMap((type) => results[type]);
+	const mapVenues = useMemo(() => searchedTypes.flatMap((type) =>
+		results[type].map((venue) => ({ venue, type: type as MapVenueType })),
+	), [results, searchedTypes]);
 	const shortlistedVenues = shortlist.map((item) => ({
 		item,
 		venue: allResults.find((candidate) => candidate.id === item.venueId),
@@ -700,12 +709,26 @@ function App() {
 								</div>
 								<p className="results-context">Near {searchedLocation} · within {searchedRadiusKm} km</p>
 							</div>
+							<div className="results-view-toggle" role="group" aria-label="Results view">
+								<button type="button" className={resultsView === "list" ? "active" : ""} aria-pressed={resultsView === "list"} onClick={() => setResultsView("list")}>List view</button>
+								<button type="button" className={resultsView === "map" ? "active" : ""} aria-pressed={resultsView === "map"} onClick={() => setResultsView("map")}>Map view</button>
+							</div>
 							<p className="results-disclaimer">
 								Showing separate lists for {selectedLabels.join(", ")}. Geoapify does not provide dependable customer ratings for these listings, so venues are ordered by listed capacity suitability and distance.
 								Known capacities below {searchedGroupSize} are omitted. Details may be incomplete; confirm group bookings directly.
 							</p>
 							{!shareId && shareError && <p className="share-warning" role="status">Results are shown, but sharing is currently unavailable.</p>}
-							{searchedTypes.map((type) => (
+							{resultsView === "map" && searchedCoordinates ? (
+								<ResultsMap
+									venues={mapVenues}
+									center={searchedCoordinates}
+									renderVenueCard={(venue, type) => renderVenueCard(
+										venue,
+										type,
+										shortlist.find((item) => item.venueId === venue.id),
+									)}
+								/>
+							) : searchedTypes.map((type) => (
 								<section className="category-results" key={type} aria-labelledby={`${type}-heading`}>
 									<div className="category-heading">
 										<h3 id={`${type}-heading`}>{venueTypeLabels[type]}</h3>

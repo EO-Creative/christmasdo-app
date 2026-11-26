@@ -456,6 +456,135 @@
 	margin-top: 32px;
 }
 
+.results-view-toggle {
+	display: inline-flex;
+	gap: 4px;
+	margin: 4px 0 17px;
+	padding: 4px;
+	border: 1px solid #dce5dc;
+	border-radius: 11px;
+	background: #f3f6f1;
+}
+
+.results-view-toggle button {
+	min-height: 38px;
+	padding: 0 15px;
+	border: 0;
+	border-radius: 8px;
+	background: transparent;
+	color: #52665a;
+	cursor: pointer;
+}
+
+.results-view-toggle button.active {
+	background: #fff;
+	box-shadow: 0 2px 6px rgba(27, 55, 45, 0.12);
+	color: #244c36;
+}
+
+.results-map-panel {
+	margin: 4px 0 28px;
+}
+
+.map-legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px 19px;
+	margin-bottom: 7px;
+}
+
+.map-legend-item {
+	display: inline-flex;
+	align-items: center;
+	gap: 7px;
+	color: #43584c;
+	font-size: 0.87rem;
+	font-weight: 650;
+}
+
+.map-legend-dot,
+.venue-marker-dot {
+	display: inline-block;
+	width: 12px;
+	height: 12px;
+	border: 2px solid #fff;
+	border-radius: 50%;
+	box-shadow: 0 1px 4px rgba(18, 38, 29, 0.35);
+}
+
+.map-legend-dot.activities,
+.venue-marker-dot.activities {
+	background: #427a50;
+}
+
+.map-legend-dot.food,
+.venue-marker-dot.food {
+	background: #d28a22;
+}
+
+.map-legend-dot.drinks,
+.venue-marker-dot.drinks {
+	background: #b44348;
+}
+
+.map-help {
+	margin: 0 0 11px;
+	color: #68786f;
+	font-size: 0.84rem;
+}
+
+.results-map {
+	width: 100%;
+	height: clamp(330px, 52vw, 520px);
+	border: 1px solid #d7e0d7;
+	border-radius: 14px;
+	background: #edf2eb;
+	box-shadow: 0 5px 16px rgba(27, 55, 45, 0.06);
+}
+
+.results-map .leaflet-marker-icon:focus-visible {
+	border-radius: 50%;
+	outline: 3px solid #1d5c3a;
+	outline-offset: 3px;
+}
+
+.venue-marker-icon {
+	border: 0;
+	background: transparent;
+}
+
+.venue-marker {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 1px;
+	width: 36px;
+	height: 36px;
+	border: 2px solid #fff;
+	border-radius: 50%;
+	background: #fff;
+	box-shadow: 0 2px 8px rgba(18, 38, 29, 0.45);
+}
+
+.venue-marker .venue-marker-dot {
+	width: 12px;
+	height: 12px;
+	border-width: 1px;
+	box-shadow: none;
+}
+
+.map-selected-venues {
+	margin-top: 22px;
+}
+
+.map-selected-venues > h3 {
+	margin: 0 0 12px;
+	color: #244536;
+	font-family: Georgia, "Times New Roman", serif;
+	font-size: 1.3rem;
+	font-weight: 500;
+}
+
 .shared-shortlist {
 	margin-top: 0;
 	margin-bottom: 42px;
@@ -692,6 +821,12 @@
 		align-items: start;
 		flex-direction: column;
 		gap: 4px;
+	}
+
+	.results-map {
+		height: 62vh;
+		min-height: 320px;
+		max-height: 480px;
 	}
 
 	.venue-list {
