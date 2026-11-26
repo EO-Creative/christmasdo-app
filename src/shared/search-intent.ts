@@ -1,10 +1,13 @@
 export type VenueType = "activities" | "food" | "drinks";
 
-export interface SearchIntent {
+export interface SearchIntentFilters {
 	types: VenueType[];
 	activityCategories: string[];
 	cuisineCategories: string[];
 	socialGames: boolean;
+}
+
+export interface SearchIntent extends SearchIntentFilters {
 	details: string[];
 	limitations: string[];
 }
@@ -32,7 +35,7 @@ const activityCategories: Array<{ category: string; label: string; terms: RegExp
 	{ category: "sport.ice_rink", label: "ice rinks", terms: /\b(?:ice\s+rink|ice\s+skating)\b/i },
 	{ category: "entertainment.bowling_alley", label: "bowling alleys", terms: /\bbowling\b/i },
 	{ category: "entertainment.escape_game", label: "escape rooms", terms: /\b(?:escape\s+rooms?|escape\s+games?)\b/i },
-	{ category: "entertainment.miniature_golf", label: "mini-golf", terms: /\b(?:mini\s+golf|crazy\s+golf)\b/i },
+	{ category: "entertainment.miniature_golf", label: "mini-golf", terms: /\b(?:mini(?:ature)?[\s-]?golf|crazy[\s-]?golf)\b/i },
 	{ category: "entertainment.amusement_arcade", label: "arcades", terms: /\b(?:arcades?|amusement\s+arcades?)\b/i },
 	{ category: "entertainment.cinema", label: "cinemas", terms: /\b(?:cinema|movie\s+theat(?:er|re)s?)\b/i },
 	{ category: "entertainment.culture.theatre", label: "theatres", terms: /\b(?:theat(?:er|re)s?|live\s+shows?)\b/i },
@@ -56,6 +59,67 @@ const socialGameReferences: Array<{ terms: RegExp; detail: string }> = [
 const directSocialGames = /\b(?:darts?|dartboards?|billiards?|snooker|pool\s+tables?|table\s+tennis|ping[ -]pong|shuffleboard)\b/i;
 const clubbingTerms = /\b(?:clubbing|night\s*clubs?)\b/i;
 const optionalPlanTerms = /\b(?:if\s+(?:they|we|you|anyone)\s+(?:want|would\s+like|choose|decide)|(?:can|will)\s+make\s+their\s+own\s+arrangements|optional(?:ly)?)\b/i;
+
+export const allowedVenueTypes: readonly VenueType[] = Object.freeze([...venueTypes]);
+export const allowedActivityCategories: readonly string[] = Object.freeze(activityCategories.map(({ category }) => category));
+export const allowedCuisineCategories: readonly string[] = Object.freeze(cuisineCategories.map(({ category }) => category));
+
+const socialGamesLimitation = "When Activities is selected, social-game alternatives and bars with explicit games data are included. Check the exact games and availability with venues.";
+const optionalClubbingLimitation = "Clubbing was mentioned as an optional later plan, so Drinks was not suggested for it; select Drinks to include it.";
+const indoorLimitation = "Indoor status is not consistently recorded, so an activity is not guaranteed to be indoors.";
+const alcoholLimitation = "Beer and wine menus are not verified; Drinks results are pubs and bars, not confirmed drink options.";
+const budgetLimitation = "Venue prices and budget fit are not available in the place data.";
+const optionalDrinksLimitation = "Drinks were mentioned as an optional later plan, so Drinks was not suggested; select Drinks to include them.";
+const allowedLimitations = [socialGamesLimitation, optionalClubbingLimitation, indoorLimitation, alcoholLimitation, budgetLimitation, optionalDrinksLimitation];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function allowedArray(value: unknown, allowed: readonly string[]): value is string[] {
+	return Array.isArray(value) && value.length <= allowed.length &&
+		Array.from(value).every((item) => typeof item === "string" && allowed.includes(item)) && new Set(value).size === value.length;
+}
+
+function hasKeys(value: Record<string, unknown>, keys: string[]): boolean {
+	return Object.keys(value).length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function validFilters(value: Record<string, unknown>): boolean {
+	if (!allowedArray(value.types, allowedVenueTypes) ||
+		!allowedArray(value.activityCategories, allowedActivityCategories) ||
+		!allowedArray(value.cuisineCategories, allowedCuisineCategories) || typeof value.socialGames !== "boolean") return false;
+	return (!(value.activityCategories.length || value.socialGames) || value.types.includes("activities")) &&
+		(!value.cuisineCategories.length || value.types.includes("food"));
+}
+
+export function isSearchIntentFilters(value: unknown): value is SearchIntentFilters {
+	return isRecord(value) && hasKeys(value, ["types", "activityCategories", "cuisineCategories", "socialGames"]) && validFilters(value);
+}
+
+export function isSearchIntent(value: unknown): value is SearchIntent {
+	if (!isRecord(value) || !hasKeys(value, ["types", "activityCategories", "cuisineCategories", "socialGames", "details", "limitations"]) || !validFilters(value)) return false;
+	const filters = value as unknown as SearchIntentFilters;
+	const allowedDetails = [
+		...(filters.socialGames ? ["social games", ...socialGameReferences.map(({ detail }) => detail)] : []),
+		...activityCategories.filter(({ category }) => filters.activityCategories.includes(category)).map(({ label }) => label),
+		...cuisineCategories.filter(({ category }) => filters.cuisineCategories.includes(category)).map(({ label }) => label),
+	];
+	return allowedArray(value.details, allowedDetails) && allowedArray(value.limitations, allowedLimitations);
+}
+
+export function searchIntentFromFilters(filters: SearchIntentFilters, rules: SearchIntent, optionalDrinks = false): SearchIntent {
+	const references = rules.details.filter((detail) => socialGameReferences.some((reference) => reference.detail === detail));
+	const details = [
+		...(filters.socialGames ? (references.length ? references : ["social games"]) : []),
+		...filters.activityCategories.map((category) => activityCategories.find((item) => item.category === category)!.label),
+		...filters.cuisineCategories.map((category) => cuisineCategories.find((item) => item.category === category)!.label),
+	];
+	const limitations = [...rules.limitations];
+	if (filters.socialGames && !limitations.includes(socialGamesLimitation)) limitations.unshift(socialGamesLimitation);
+	if (optionalDrinks && !filters.types.includes("drinks") && !limitations.includes(optionalClubbingLimitation)) limitations.push(optionalDrinksLimitation);
+	return { ...filters, details, limitations };
+}
 
 const sportSearchCategories = activityCategories
 	.filter(({ category }) => ["sport.sports_centre", "sport.sports_hall", "sport.ice_rink", "entertainment.bowling_alley"].includes(category))
@@ -107,11 +171,19 @@ function hasOptionalMention(text: string, terms: RegExp): boolean {
 	return false;
 }
 
+export function excludedActivityCategories(prompt: string): string[] {
+	const text = prompt.trim();
+	return activityCategories
+		.filter(({ terms }) => excludedMatch(text, terms) && !requestedMatch(text, terms))
+		.map(({ category }) => category);
+}
+
 export function parseSearchIntent(prompt: string): SearchIntent {
 	const text = prompt.trim();
+	const textWithoutMiniGolf = text.replace(/\b(?:mini(?:ature)?|crazy)[\s-]?golf\b/gi, " minigolf ");
 	const cuisineMatches = cuisineCategories.filter(({ terms }) => requestedMatch(text, terms));
 	const activityMatches = activityCategories
-		.filter(({ terms }) => requestedMatch(text, terms))
+		.filter(({ category, terms }) => requestedMatch(category === "sport.golf_course" ? textWithoutMiniGolf : text, terms))
 		.map(({ category, label }) => ({ category, label }));
 	const socialGameReferenceMatches = socialGameReferences.filter(({ terms }) => requestedMatch(text, terms));
 	const socialGames = socialGameReferenceMatches.length > 0 || requestedMatch(text, directSocialGames);
@@ -141,12 +213,12 @@ export function parseSearchIntent(prompt: string): SearchIntent {
 	const budgetMentioned = requestedMatch(text, /\b(?:budget|mid[ -]?range|moderate|cheap|affordable|expensive|price[ -]?range)\b/i);
 	const limitations: string[] = [];
 	if (socialGames) {
-		limitations.push("When Activities is selected, social-game alternatives and bars with explicit games data are included. Check the exact games and availability with venues.");
+		limitations.push(socialGamesLimitation);
 	}
-	if (optionalClubbing && !requestsClubbing) limitations.push("Clubbing was mentioned as an optional later plan, so Drinks was not suggested for it; select Drinks to include it.");
-	if (indoorMentioned) limitations.push("Indoor status is not consistently recorded, so an activity is not guaranteed to be indoors.");
-	if (alcoholMentioned) limitations.push("Beer and wine menus are not verified; Drinks results are pubs and bars, not confirmed drink options.");
-	if (budgetMentioned) limitations.push("Venue prices and budget fit are not available in the place data.");
+	if (optionalClubbing && !requestsClubbing) limitations.push(optionalClubbingLimitation);
+	if (indoorMentioned) limitations.push(indoorLimitation);
+	if (alcoholMentioned) limitations.push(alcoholLimitation);
+	if (budgetMentioned) limitations.push(budgetLimitation);
 
 	const details = [
 		...socialGameReferenceMatches.map(({ detail }) => detail),

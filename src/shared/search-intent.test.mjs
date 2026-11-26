@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseSearchIntent } from "./search-intent.ts";
+import { excludedActivityCategories, isSearchIntent, isSearchIntentFilters, parseSearchIntent } from "./search-intent.ts";
 
 test("parses the conversational example into supported category searches and caveats", () => {
 	const intent = parseSearchIntent("Indoor sports activities with options for beer and wine at a midrange buget and some Lebanese food");
@@ -100,4 +100,52 @@ test("reports unsupported preferences even when no search category is recognized
 	const intent = parseSearchIntent("A mid-range place indoors");
 	assert.deepEqual(intent.types, []);
 	assert.equal(intent.limitations.length, 2);
+});
+
+test("mini-golf wording is not mistaken for a golf course", () => {
+	for (const prompt of ["Crazy golf then cocktails", "mini-golf", "Miniature golf with the team"]) {
+		assert.deepEqual(parseSearchIntent(prompt).activityCategories, ["entertainment.miniature_golf"], prompt);
+	}
+	assert.deepEqual(parseSearchIntent("A round of golf, then crazy golf").activityCategories, ["entertainment.miniature_golf", "sport.golf_course"]);
+});
+
+test("reports only activities that are named and excluded", () => {
+	assert.deepEqual(excludedActivityCategories("Sporty afternoon but definitely not bowling, then kebabs"), ["entertainment.bowling_alley"]);
+	assert.deepEqual(excludedActivityCategories("No cinema. Bowling instead"), ["entertainment.cinema"]);
+	assert.deepEqual(excludedActivityCategories("Not bowling at lunch, but bowling in the evening"), []);
+	assert.deepEqual(excludedActivityCategories("A quiet meal"), []);
+});
+
+test("validates rule-generated intents and their filters", () => {
+	for (const prompt of ["", "Indoor bowling and Italian food with wine", "Something like Flight Club, or go clubbing if they want"]) {
+		const intent = parseSearchIntent(prompt);
+		assert.equal(isSearchIntent(intent), true, prompt);
+		const { types, activityCategories, cuisineCategories, socialGames } = intent;
+		assert.equal(isSearchIntentFilters({ types, activityCategories, cuisineCategories, socialGames }), true, prompt);
+	}
+});
+
+test("rejects unsafe or inconsistent client filters and snapshot details", () => {
+	const filters = { types: ["activities", "food"], activityCategories: ["entertainment.bowling_alley"], cuisineCategories: ["catering.restaurant.thai"], socialGames: false };
+	for (const candidate of [
+		null, [], {}, { ...filters, extra: true },
+		{ ...filters, types: ["activities", "activities"] },
+		{ ...filters, types: Array(1) },
+		{ ...filters, types: ["activities", "hotels"] },
+		{ ...filters, activityCategories: ["catering.restaurant.thai"] },
+		{ ...filters, cuisineCategories: ["catering.restaurant"] },
+		{ ...filters, types: ["food"] },
+		{ ...filters, types: ["activities"] },
+		{ ...filters, types: ["food"], activityCategories: [], socialGames: true },
+		{ ...filters, socialGames: "true" },
+	]) assert.equal(isSearchIntentFilters(candidate), false, JSON.stringify(candidate));
+
+	const intent = parseSearchIntent("Bowling and Thai food");
+	for (const candidate of [
+		{ ...intent, extra: "ignored?" },
+		{ ...intent, details: ["<script>unsafe</script>"] },
+		{ ...intent, details: ["Italian restaurants"] },
+		{ ...intent, limitations: ["untrusted text"] },
+		{ ...intent, details: ["bowling alleys", "bowling alleys"] },
+	]) assert.equal(isSearchIntent(candidate), false, JSON.stringify(candidate));
 });

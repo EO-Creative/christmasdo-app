@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCapacityStatus, sortVenuesBySuitability } from "./venue-utils";
 import { ResultsMap } from "./ResultsMap";
-import type { VenueType as MapVenueType } from "./map-utils";
-import { parseSearchIntent, type VenueType } from "../shared/search-intent.ts";
+import { distanceMeters, type VenueType as MapVenueType } from "./map-utils";
+import { parseSearchIntent, type SearchIntent, type VenueType } from "../shared/search-intent.ts";
 import "./App.css";
 
 interface Venue {
@@ -25,6 +25,7 @@ interface Venue {
 		website?: string;
 		phone?: string;
 		capacity?: string;
+		price?: string;
 	};
 }
 
@@ -45,6 +46,7 @@ interface SearchSnapshot {
 	radiusKm: number;
 	types: VenueType[];
 	prompt?: string;
+	intent?: SearchIntent;
 	results: Record<VenueType, Venue[]>;
 }
 
@@ -105,6 +107,20 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 	return data;
 }
 
+function normalizedResults(data: VenueSearchResponse, groupSize: number): Record<VenueType, Venue[]> {
+	return Object.fromEntries(venueTypes.map((type) => {
+		const venues = Array.isArray(data.results?.[type])
+			? data.results[type]!.filter((venue) => venue.tags?.name &&
+				Number.isFinite(venue.lat ?? venue.center?.lat) && Number.isFinite(venue.lon ?? venue.center?.lon))
+			: [];
+		return [type, sortVenuesBySuitability(venues, groupSize)];
+	})) as Record<VenueType, Venue[]>;
+}
+
+function mapSearchCenter(center: { lat: number; lon: number }) {
+	return { lat: Math.max(-90, Math.min(90, Math.round(center.lat * 200) / 200)), lon: Math.max(-180, Math.min(180, Math.round(center.lon * 200) / 200)) };
+}
+
 function safeWebsiteUrl(value: string): string | undefined {
 	try {
 		const url = new URL(/^[a-z][a-z\d+.-]*:/i.test(value) ? value : `https://${value}`);
@@ -133,6 +149,19 @@ function App() {
 	const [types, setTypes] = useState({ activities: false, food: false, drinks: false });
 	const [radiusKm, setRadiusKm] = useState(5);
 	const [results, setResults] = useState<Record<VenueType, Venue[]>>({ activities: [], food: [], drinks: [] });
+	const [sharedResults, setSharedResults] = useState<Record<VenueType, Venue[]>>({ activities: [], food: [], drinks: [] });
+	const [interpreted, setInterpreted] = useState<{ prompt: string; intent: SearchIntent; source: "ai" | "rules" | "saved" }>();
+	const [searchedIntent, setSearchedIntent] = useState<SearchIntent>(() => parseSearchIntent(""));
+	const [interpreting, setInterpreting] = useState(false);
+	const [typesEdited, setTypesEdited] = useState(false);
+	const promptRef = useRef(prompt);
+	const [mapCenter, setMapCenter] = useState<{ lat: number; lon: number }>();
+	const lastMapCenter = useRef("");
+	const [mapLoading, setMapLoading] = useState(false);
+	const [mapError, setMapError] = useState("");
+	const [mapRetry, setMapRetry] = useState(0);
+	const [distanceFromId, setDistanceFromId] = useState("");
+	const [distanceToId, setDistanceToId] = useState("");
 	const [shareId, setShareId] = useState(() => new URLSearchParams(window.location.search).get("share") || "");
 	const [voterId, setVoterId] = useState("");
 	const [shortlist, setShortlist] = useState<ShortlistItem[]>([]);
@@ -144,14 +173,20 @@ function App() {
 	const [resultsView, setResultsView] = useState<"list" | "map">("list");
 	const [error, setError] = useState("");
 	const [shareError, setShareError] = useState("");
-	const promptIntent = useMemo(() => parseSearchIntent(prompt), [prompt]);
-	const searchedIntent = useMemo(() => parseSearchIntent(searchedPrompt), [searchedPrompt]);
+	const promptIntent = interpreted?.prompt === prompt.trim() ? interpreted.intent : parseSearchIntent(prompt);
 
 	const applySharedSearch = useCallback((shared: SharedSearchResponse) => {
 		const snapshot = shared.snapshot;
 		setShareId(shared.id);
 		setPrompt(snapshot.prompt ?? "");
+		promptRef.current = snapshot.prompt ?? "";
 		setSearchedPrompt(snapshot.prompt ?? "");
+		setSearchedIntent(snapshot.intent ?? parseSearchIntent(snapshot.prompt ?? ""));
+		setInterpreted(snapshot.intent ? { prompt: snapshot.prompt ?? "", intent: snapshot.intent, source: "saved" } : undefined);
+		setTypesEdited(true);
+		setMapCenter(undefined);
+		const initialMapCenter = mapSearchCenter(snapshot.location);
+		lastMapCenter.current = `${initialMapCenter.lat},${initialMapCenter.lon}`;
 		setLocation(snapshot.location.label);
 		setSelectedLocation({
 			id: snapshot.location.label,
@@ -172,6 +207,7 @@ function App() {
 			drinks: snapshot.types.includes("drinks"),
 		});
 		setResults(snapshot.results);
+		setSharedResults(snapshot.results);
 		setShortlist(shared.shortlist);
 		setHasSearched(true);
 	}, []);
@@ -181,7 +217,10 @@ function App() {
 			`/api/searches/${encodeURIComponent(id)}?voterId=${encodeURIComponent(browserVoterId)}`,
 		);
 		if (applySnapshot) applySharedSearch(shared);
-		else setShortlist(shared.shortlist);
+		else {
+			setShortlist(shared.shortlist);
+			setSharedResults(shared.snapshot.results);
+		}
 	}, [applySharedSearch]);
 
 	useEffect(() => {
@@ -243,7 +282,10 @@ function App() {
 				const shared = await requestJson<SharedSearchResponse>(
 					`/api/searches/${encodeURIComponent(shareId)}?voterId=${encodeURIComponent(voterId)}`,
 				);
-				if (active) setShortlist(shared.shortlist);
+				if (active) {
+					setShortlist(shared.shortlist);
+					setSharedResults(shared.snapshot.results);
+				}
 			} catch {
 				if (active) setShareError("Could not refresh shared votes; try again shortly.");
 			}
@@ -256,17 +298,50 @@ function App() {
 	}, [shareId, voterId]);
 
 	const handleTypeChange = (type: keyof typeof types) => {
+		setTypesEdited(true);
 		setTypes((prev) => ({ ...prev, [type]: !prev[type] }));
 	};
 
 	const handlePromptChange = (value: string) => {
 		setPrompt(value);
+		promptRef.current = value;
+		setInterpreted(undefined);
+		setTypesEdited(false);
 		const inferredTypes = parseSearchIntent(value).types;
 		setTypes({
 			activities: inferredTypes.includes("activities"),
 			food: inferredTypes.includes("food"),
 			drinks: inferredTypes.includes("drinks"),
 		});
+	};
+
+	const interpretDescription = async (text: string) => {
+		if (!text) return { intent: parseSearchIntent(""), source: "rules" as const };
+		if (interpreted?.prompt === text) return interpreted;
+		setInterpreting(true);
+		try {
+			const data = await requestJson<{ intent: SearchIntent; source: "ai" | "rules" }>("/api/interpret", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ prompt: text }),
+			}).catch(() => ({ intent: parseSearchIntent(text), source: "rules" as const }));
+			if (promptRef.current.trim() !== text) throw new Error("Your description changed; please search again.");
+			setInterpreted({ prompt: text, ...data });
+			return data;
+		} finally {
+			setInterpreting(false);
+		}
+	};
+
+	const interpretForReview = async () => {
+		setError("");
+		try {
+			const data = await interpretDescription(prompt.trim());
+			setTypes(Object.fromEntries(venueTypes.map((type) => [type, data.intent.types.includes(type)])) as typeof types);
+			setTypesEdited(false);
+		} catch (caughtError) {
+			setError(caughtError instanceof Error ? caughtError.message : "Could not interpret your description.");
+		}
 	};
 
 	const selectLocation = (place: GeocodingResult) => {
@@ -303,6 +378,7 @@ function App() {
 		setShareId("");
 		setShortlist([]);
 		setResults({ activities: [], food: [], drinks: [] });
+		setSearchedCoordinates(undefined);
 		setHasSearched(true);
 		setSuggestionsOpen(false);
 		window.history.replaceState(null, "", window.location.pathname);
@@ -314,17 +390,14 @@ function App() {
 			return;
 		}
 
-		const selectedTypes = Object.entries(types)
-			.filter(([, enabled]) => enabled)
-			.map(([type]) => type as keyof typeof venueTypeLabels);
-		if (selectedTypes.length === 0) {
-			setError("Choose at least one venue type to search.");
-			return;
-		}
-
 		setSearchedGroupSize(requestedGroupSize);
 		setLoading(true);
 		try {
+			const interpretation = await interpretDescription(submittedPrompt);
+			const selectedTypes = typesEdited || !submittedPrompt
+				? venueTypes.filter((type) => types[type]) : interpretation.intent.types;
+			if (selectedTypes.length === 0) throw new Error("Choose at least one venue type to search.");
+			setTypes(Object.fromEntries(venueTypes.map((type) => [type, selectedTypes.includes(type)])) as typeof types);
 			let place = selectedLocation;
 			if (!place) {
 				const geocodingResults = await requestJson<LocationSearchResponse>(
@@ -347,19 +420,15 @@ function App() {
 				groupSize: String(requestedGroupSize),
 				radiusKm: String(radiusKm),
 				prompt: submittedPrompt,
+				intent: JSON.stringify(interpretation.intent),
 			});
 			const venueData = await requestJson<VenueSearchResponse>(`/api/venues?${params}`);
-			const groupedResults = Object.fromEntries(venueTypes.map((type) => {
-				const venues = Array.isArray(venueData.results?.[type])
-					? venueData.results[type]!.filter((venue) =>
-							venue.tags?.name &&
-							Number.isFinite(venue.lat ?? venue.center?.lat) &&
-							Number.isFinite(venue.lon ?? venue.center?.lon),
-						)
-					: [];
-			return [type, sortVenuesBySuitability(venues, requestedGroupSize)];
-			})) as Record<VenueType, Venue[]>;
+			const groupedResults = normalizedResults(venueData, requestedGroupSize);
 			setResults(groupedResults);
+			setSharedResults(groupedResults);
+			setMapCenter(undefined);
+			const initialMapCenter = mapSearchCenter(place);
+			lastMapCenter.current = `${initialMapCenter.lat},${initialMapCenter.lon}`;
 			setLocation(place.label);
 			setSelectedLocation(place);
 			setSearchedCoordinates({ lat, lon });
@@ -369,9 +438,11 @@ function App() {
 				radiusKm,
 				types: selectedTypes,
 				prompt: submittedPrompt || undefined,
+				intent: interpretation.intent,
 				results: groupedResults,
 			};
 			setSearchedPrompt(submittedPrompt);
+			setSearchedIntent(interpretation.intent);
 			setSearchedLocation(snapshot.location.label);
 			setSearchedRadiusKm(snapshot.radiusKm);
 			setSearchedTypes(snapshot.types);
@@ -396,6 +467,32 @@ function App() {
 		}
 	};
 
+	useEffect(() => {
+		if (!mapCenter || resultsView !== "map" || !searchedTypes.length) return;
+		const controller = new AbortController();
+		const timer = window.setTimeout(async () => {
+			setMapLoading(true);
+			setMapError("");
+			try {
+				const params = new URLSearchParams({
+					lat: String(mapCenter.lat), lon: String(mapCenter.lon), types: searchedTypes.join(","),
+					groupSize: String(searchedGroupSize), radiusKm: String(searchedRadiusKm),
+					intent: JSON.stringify(searchedIntent),
+				});
+				const data = await requestJson<VenueSearchResponse>(`/api/venues?${params}`, { signal: controller.signal });
+				if (!controller.signal.aborted) setResults(normalizedResults(data, searchedGroupSize));
+			} catch {
+				if (!controller.signal.aborted) setMapError("Could not refresh venues for this area. Move the map or try again.");
+			} finally {
+				if (!controller.signal.aborted) setMapLoading(false);
+			}
+		}, 700);
+		return () => {
+			window.clearTimeout(timer);
+			controller.abort();
+		};
+	}, [mapCenter, mapRetry, resultsView, searchedTypes, searchedGroupSize, searchedRadiusKm, searchedIntent]);
+
 	const selectedLabels = searchedTypes.map((type) => venueTypeLabels[type]);
 	const allResults = venueTypes.flatMap((type) => results[type]);
 	const mapVenues = useMemo(() => searchedTypes.flatMap((type) =>
@@ -403,12 +500,29 @@ function App() {
 	), [results, searchedTypes]);
 	const shortlistedVenues = shortlist.map((item) => ({
 		item,
-		venue: allResults.find((candidate) => candidate.id === item.venueId),
+		venue: venueTypes.flatMap((type) => sharedResults[type]).find((candidate) => candidate.id === item.venueId),
 	})).filter((entry): entry is { item: ShortlistItem; venue: Venue } => Boolean(entry.venue));
 	const shortlistedVenuesByType = (type: VenueType) => shortlist.flatMap((item) => {
-		const venue = results[type].find((candidate) => candidate.id === item.venueId);
+		const venue = sharedResults[type].find((candidate) => candidate.id === item.venueId);
 		return venue ? [{ item, venue }] : [];
 	}).sort((first, second) => second.item.votes[type] - first.item.votes[type] || first.item.addedAt - second.item.addedAt);
+	const distanceVenues = shortlistedVenues.flatMap(({ venue }) => {
+		const lat = venue.lat ?? venue.center?.lat;
+		const lon = venue.lon ?? venue.center?.lon;
+		return typeof lat === "number" && typeof lon === "number" ? [{ venue, lat, lon }] : [];
+	});
+	const distanceFrom = distanceVenues.find(({ venue }) => venue.id === distanceFromId) ?? distanceVenues[0];
+	const distanceTo = distanceVenues.find(({ venue }) => venue.id === distanceToId) ?? distanceVenues.find(({ venue }) => venue.id !== distanceFrom?.venue.id);
+	const shortlistDistance = distanceFrom && distanceTo ? distanceMeters(distanceFrom, distanceTo) : undefined;
+
+	const handleViewportChange = (center: { lat: number; lon: number }) => {
+		// Search from the centre of a small grid cell so nearby map moves can share cached results.
+		const rounded = mapSearchCenter(center);
+		const key = `${rounded.lat},${rounded.lon}`;
+		if (lastMapCenter.current === key) return;
+		lastMapCenter.current = key;
+		setMapCenter(rounded);
+	};
 	const shareUrl = shareId ? new URL(`?share=${encodeURIComponent(shareId)}`, window.location.href).href : "";
 
 	const refreshVotes = async () => {
@@ -429,10 +543,14 @@ function App() {
 		setBusyVenueId(venueId);
 		setShareError("");
 		try {
+			const entries = searchedTypes.flatMap((type) => {
+				const venue = results[type].find((candidate) => candidate.id === venueId);
+				return venue ? [{ type, venue }] : [];
+			});
 			await requestJson(`/api/searches/${encodeURIComponent(shareId)}/shortlist`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ venueId, action }),
+				body: JSON.stringify({ venueId, action, ...(action === "add" && entries.length ? { entries } : {}) }),
 			});
 			await loadSharedSearch(shareId, voterId, false);
 		} catch (caughtError) {
@@ -447,6 +565,15 @@ function App() {
 		setBusyVenueId(venueId);
 		setShareError("");
 		try {
+			if (!sharedResults[category].some((venue) => venue.id === venueId)) {
+				const venue = results[category].find((candidate) => candidate.id === venueId);
+				if (!venue) throw new Error("This venue is no longer available in this category.");
+				await requestJson(`/api/searches/${encodeURIComponent(shareId)}/shortlist`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ venueId, action: "add", entries: [{ type: category, venue }] }),
+				});
+			}
 			await requestJson(`/api/searches/${encodeURIComponent(shareId)}/votes`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
@@ -482,7 +609,7 @@ function App() {
 			venue.tags["addr:city"],
 			venue.tags["addr:postcode"],
 		].filter(Boolean).join(", ");
-		const distance = typeof venue.distance === "number" ? `${(venue.distance / 1000).toFixed(1)} km away` : "";
+		const distance = typeof venue.distance === "number" ? `${(venue.distance / 1000).toFixed(1)} km from its search centre` : "";
 		const website = venue.tags.website ? safeWebsiteUrl(venue.tags.website) : undefined;
 		const phoneLink = venue.tags.phone?.replace(/[^\d+]/g, "");
 		const mapUrl = `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=17/${lat}/${lon}`;
@@ -504,8 +631,9 @@ function App() {
 				<p className={`capacity-detail ${capacityStatus}`}>
 					{capacityStatus === "fits" && `Listed capacity: ${venue.tags.capacity} people`}
 					{capacityStatus === "too-small" && `Listed for ${venue.tags.capacity} people; your group is ${searchedGroupSize}`}
-					{capacityStatus === "unknown" && "No numeric capacity listed for this venue."}
+					{capacityStatus === "unknown" && (venue.tags.capacity ? `Capacity listed: ${venue.tags.capacity} (confirm with venue).` : "Capacity unknown; ask the venue about your group.")}
 				</p>
+				<p className="capacity-detail">{venue.tags.price ? `Listed price information: ${venue.tags.price}. Confirm current group prices.` : "Price unknown; ask the venue for a quote."}</p>
 				<div className="venue-links">
 					<a href={mapUrl} target="_blank" rel="noreferrer">View map <span aria-hidden="true">↗</span></a>
 					{website && <a href={website} target="_blank" rel="noreferrer">Website <span aria-hidden="true">↗</span></a>}
@@ -565,6 +693,14 @@ function App() {
 					</div>
 					{error && <p className="error share-error" role="alert">{error}</p>}
 					{shareError && <p className="error share-error" role="alert">{shareError}</p>}
+					{distanceVenues.length >= 2 && (
+						<div className="shortlist-distance">
+							<h3>Distance between venues</h3>
+							<label>From <select value={distanceFrom?.venue.id ?? ""} onChange={(event) => setDistanceFromId(event.target.value)}>{distanceVenues.map(({ venue }) => <option key={venue.id} value={venue.id}>{venue.tags.name}</option>)}</select></label>
+							<label>To <select value={distanceTo?.venue.id ?? ""} onChange={(event) => setDistanceToId(event.target.value)}>{distanceVenues.map(({ venue }) => <option key={venue.id} value={venue.id}>{venue.tags.name}</option>)}</select></label>
+							<p>{shortlistDistance === undefined ? "Distance unavailable." : `${shortlistDistance < 1000 ? `${Math.round(shortlistDistance)} m` : `${(shortlistDistance / 1000).toFixed(1)} km`} in a straight line · roughly ${Math.max(1, Math.round(shortlistDistance * 1.3 / 80))} min walk. The walking time is an estimate, not a routed journey.`}</p>
+						</div>
+					)}
 					{!hasSearched ? (
 						<p className="loading-message">Loading the shared shortlist…</p>
 					) : searchedTypes.map((type) => {
@@ -613,11 +749,13 @@ function App() {
 								placeholder="e.g. Indoor sports activities with options for beer and wine, a mid-range budget, and some Lebanese food"
 							/>
 							<p className="field-hint" id="prompt-hint">
-								Tell us what you’d enjoy; choose the search location and group size below. Up to 500 characters.
+								Tell us what you’d enjoy; choose the search location and group size below. Up to 500 characters. Your description is sent to Cloudflare Workers AI for filter suggestions.
 							</p>
+							<button type="button" className="refresh-button" disabled={!prompt.trim() || interpreting || loading} onClick={interpretForReview}>{interpreting ? "Interpreting…" : "Interpret description"}</button>
 							<div className="search-interpretation" id="prompt-interpretation" aria-live="polite">
 								{prompt.trim() ? (
 									<>
+										<p>{interpreted?.prompt === prompt.trim() ? (interpreted.source === "ai" ? "AI interpretation; review the suggested filters." : interpreted.source === "saved" ? "Showing the filters saved with this shared search." : "AI unavailable or not used; using limited phrase matching. Review the filters.") : "Preliminary phrase suggestions. Interpret the description or search to use AI."}</p>
 										<p>
 											<strong>Suggested categories:</strong>{" "}
 											{promptIntent.types.length
@@ -632,12 +770,13 @@ function App() {
 											</ul>
 										)}
 									</>
-								) : <p>Known venue references such as Flight Club and supported activity or cuisine phrases can suggest searches; you can also choose categories below.</p>}
+								) : <p>Describe your plans or choose categories below. You can review suggestions before searching.</p>}
 							</div>
 						</div>
 						<div className="input-row">
 							<div className="form-group location-field">
 								<label htmlFor="location">Suggested location</label>
+								<p className="field-hint">Suggestions are towns and cities; you can also type a full address and search without selecting a suggestion.</p>
 								<input
 									id="location"
 									type="text"
@@ -733,7 +872,7 @@ function App() {
 							</div>
 						</fieldset>
 
-						<button className="search-button" type="submit" disabled={loading}>
+						<button className="search-button" type="submit" disabled={loading || interpreting}>
 							{loading ? "Searching nearby places…" : "Find venues"}
 							<span aria-hidden="true">→</span>
 						</button>
@@ -754,22 +893,21 @@ function App() {
 						</div>
 					)}
 					{!loading && shareError && !shareId && <p className="error share-error" role="alert">{shareError}</p>}
-					{hasSearched && !loading && (allResults.length > 0 || shareId !== "") && (
+					{hasSearched && !loading && searchedCoordinates && (
 						<>
 							<div className="results-heading">
 								<div>
 									<p className="step-label">Venue options</p>
 									<h2 id="results-title">Results by category</h2>
 								</div>
-								<p className="results-context">Near {searchedLocation} · within {searchedRadiusKm} km</p>
+								<p className="results-context">{mapCenter ? "Around the last map centre" : `Near ${searchedLocation}`} · within {searchedRadiusKm} km</p>
 							</div>
 							<div className="results-view-toggle" role="group" aria-label="Results view">
 								<button type="button" className={resultsView === "list" ? "active" : ""} aria-pressed={resultsView === "list"} onClick={() => setResultsView("list")}>List view</button>
 								<button type="button" className={resultsView === "map" ? "active" : ""} aria-pressed={resultsView === "map"} onClick={() => setResultsView("map")}>Map view</button>
 							</div>
 							<p className="results-disclaimer">
-								Showing separate lists for {selectedLabels.join(", ")}. Geoapify does not provide dependable customer ratings for these listings, so venues are ordered by listed capacity suitability and distance.
-								Known capacities below {searchedGroupSize} are omitted. Details may be incomplete; confirm group bookings directly.
+								Showing separate lists for {selectedLabels.join(", ")}. Up to 20 results per category are returned within the chosen radius, not every venue in the city. Geoapify does not provide dependable ratings. Known capacities below {searchedGroupSize} are omitted; confirm prices and group bookings directly.
 							</p>
 							{searchedPrompt && <p className="results-request">Your request: {searchedPrompt}</p>}
 							{searchedIntent.limitations.length > 0 && (
@@ -779,15 +917,21 @@ function App() {
 							)}
 							{!shareId && shareError && <p className="share-warning" role="status">Results are shown, but sharing is currently unavailable.</p>}
 							{resultsView === "map" && searchedCoordinates ? (
+								<>
+								<p role="status">{mapLoading ? "Updating venues around the map centre…" : mapError || "Move the map to search nearby; the panel shows venues in view."}</p>
+								{mapError && <button type="button" className="refresh-button" onClick={() => setMapRetry((value) => value + 1)}>Retry area search</button>}
 								<ResultsMap
+									key={`${searchedCoordinates.lat},${searchedCoordinates.lon},${shareId}`}
 									venues={mapVenues}
-									center={searchedCoordinates}
+									center={mapCenter ?? searchedCoordinates}
+									onViewportChange={handleViewportChange}
 									renderVenueCard={(venue, type) => renderVenueCard(
 										venue,
 										type,
 										shortlist.find((item) => item.venueId === venue.id),
 									)}
 								/>
+								</>
 							) : searchedTypes.map((type) => (
 								<section className="category-results" key={type} aria-labelledby={`${type}-heading`}>
 									<div className="category-heading">

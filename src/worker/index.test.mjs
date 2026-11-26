@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import app from "./index.ts";
+import { parseSearchIntent } from "../shared/search-intent.ts";
 
 const bindings = { GEOAPIFY_API_KEY: "test-api-key" };
 
@@ -8,6 +9,7 @@ class MemoryD1 {
 	searches = new Map();
 	shortlist = new Map();
 	votes = new Map();
+	aiUsage = new Map();
 
 	prepare(query) {
 		return {
@@ -20,6 +22,12 @@ class MemoryD1 {
 	}
 
 	first(query, values) {
+		if (query.includes("INSERT INTO ai_daily_usage")) {
+			const count = this.aiUsage.get(values[0]) ?? 0;
+			if (count >= 100) return null;
+			this.aiUsage.set(values[0], count + 1);
+			return { requests: count + 1 };
+		}
 		if (query.includes("SELECT search_json, created_at FROM searches")) {
 			const search = this.searches.get(values[0]);
 			return search && { search_json: search.json, created_at: search.createdAt };
@@ -48,6 +56,15 @@ class MemoryD1 {
 	run(query, values) {
 		if (query.includes("INSERT INTO searches")) {
 			this.searches.set(values[0], { createdAt: values[1], json: values[2] });
+		} else if (query.includes("UPDATE searches SET search_json = json_insert")) {
+			const [path, raw, id, , , , venueId] = values;
+			const search = this.searches.get(id);
+			const snapshot = JSON.parse(search.json);
+			const venues = snapshot.results[path.split(".").at(-1)];
+			if (venues.length < 200 && search.json.length + raw.length < 1000000 && !venues.some((venue) => venue.id === venueId)) {
+				venues.push(JSON.parse(raw));
+				search.json = JSON.stringify(snapshot);
+			}
 		} else if (query.includes("INSERT OR IGNORE INTO shortlist")) {
 			this.shortlist.set(`${values[0]}:${values[1]}`, values[2]);
 		} else if (query.includes("DELETE FROM shortlist")) {
@@ -147,6 +164,7 @@ test("autocomplete requests Geoapify and maps valid suggestions", async () => {
 		assert.equal(url.searchParams.get("text"), "York, UK");
 		assert.equal(url.searchParams.get("format"), "json");
 		assert.equal(url.searchParams.get("limit"), "5");
+		assert.equal(url.searchParams.get("type"), "city");
 		return Response.json({ results: [
 			{ place_id: "york", formatted: "York, UK", lat: 53.96, lon: -1.08 },
 			{ place_id: "invalid", formatted: "Out of range", lat: 95, lon: 0 },
@@ -167,13 +185,30 @@ test("manual geocoding uses Geoapify forward search and normalizes coordinates",
 		assert.equal(url.hostname, "api.geoapify.com");
 		assert.equal(url.pathname, "/v1/geocode/search");
 		assert.equal(url.searchParams.get("text"), "York, UK");
-		assert.equal(url.searchParams.get("limit"), "1");
-		return Response.json({ results: [{ place_id: "york", formatted: "York, UK", lat: 53.96, lon: -1.08 }] });
+		assert.equal(url.searchParams.get("limit"), "5");
+		assert.equal(url.searchParams.get("type"), "city");
+		return Response.json({ results: [{ place_id: "york", city: "York", formatted: "York, UK", lat: 53.96, lon: -1.08 }] });
 	}, async () => {
 		const response = await app.request("/api/geocode?q=York%2C%20UK", {}, bindings);
 		assert.equal(response.status, 200);
 		assert.equal((await response.json()).results[0].id, "york");
 	});
+});
+
+test("geocoding prefers an exact city match but falls back for a specific address", async () => {
+	const queries = [];
+	await withMockedFetch(async (input) => {
+		const url = new URL(String(input));
+		queries.push(url.searchParams.get("type"));
+		const text = url.searchParams.get("text");
+		if (text === "Liverpool") return Response.json({ results: [{ place_id: "wrong", city: "Liverpool", formatted: "yes, Liverpool, UK", lat: 53.39, lon: -2.92 }, { place_id: "city", city: "Liverpool", formatted: "Liverpool, UK", lat: 53.407, lon: -2.99 }] });
+		if (url.searchParams.get("type") === "city") return Response.json({ results: [{ city: "Liverpool", formatted: "Liverpool, UK", lat: 53.407, lon: -2.99 }] });
+		return Response.json({ results: [{ place_id: "address", formatted: "1 Road, Liverpool", lat: 53.41, lon: -2.99 }] });
+	}, async () => {
+		assert.equal((await (await app.request("/api/geocode?q=Liverpool", {}, bindings)).json()).results[0].id, "city");
+		assert.equal((await (await app.request("/api/geocode?q=1%20Road%2C%20Liverpool", {}, bindings)).json()).results[0].id, "address");
+	});
+	assert.deepEqual(queries, ["city", "city", null]);
 });
 
 test("geocoding rejects a blank location", async () => {
@@ -589,6 +624,71 @@ test("venue search calculates a distance when the provider omits it", async () =
 		assert.ok(venue.distance > 0);
 		assert.ok(venue.distance < 5000);
 	});
+});
+
+test("interpretation endpoint enforces the daily AI cap and falls back without D1", async () => {
+	const database = new MemoryD1();
+	let calls = 0;
+	const AI = { run: async (_model, input) => {
+		calls++;
+		return { model: "clef-flash", answers: Object.fromEntries(Object.keys(input.questions).map((id) => [id, { type: "noul", noul: id === "type.food" ? 0.9 : 0 }])) };
+	} };
+	const request = (env) => app.request("/api/interpret", { method: "POST", body: JSON.stringify({ prompt: "An Italian dinner" }) }, env);
+	assert.equal((await (await request({ AI })).json()).source, "rules");
+	for (let index = 0; index < 100; index++) assert.equal((await (await request({ AI, DB: database })).json()).source, "ai");
+	assert.equal((await (await request({ AI, DB: database })).json()).source, "rules");
+	assert.equal(calls, 100);
+	assert.equal((await app.request("/api/interpret", { method: "POST", body: JSON.stringify({ prompt: "x".repeat(501) }) }, { AI, DB: database })).status, 400);
+});
+
+test("venue search validates saved filters and persists them in shared snapshots", async () => {
+	const intent = parseSearchIntent("Italian food");
+	await withMockedFetch(async (input) => {
+		assert.equal(new URL(String(input)).searchParams.get("categories"), "catering.restaurant.italian");
+		return Response.json({ features: [] });
+	}, async () => {
+		const params = new URLSearchParams({ lat: "53.96", lon: "-1.08", types: "food", groupSize: "10", radiusKm: "5", intent: JSON.stringify(intent) });
+		assert.equal((await app.request(`/api/venues?${params}`, {}, bindings)).status, 200);
+		params.set("intent", JSON.stringify({ ...intent, cuisineCategories: ["not.allowed"] }));
+		assert.equal((await app.request(`/api/venues?${params}`, {}, bindings)).status, 400);
+	});
+	const database = new MemoryD1();
+	const create = await app.request("/api/searches", { method: "POST", body: JSON.stringify({ ...testSnapshot, intent }) }, { DB: database });
+	const { id } = await create.json();
+	const shared = await (await app.request(`/api/searches/${id}`, {}, { DB: database })).json();
+	assert.deepEqual(shared.snapshot.intent, intent);
+	assert.equal((await app.request("/api/searches", { method: "POST", body: JSON.stringify({ ...testSnapshot, intent: { ...intent, cuisineCategories: ["not.allowed"] } }) }, { DB: database })).status, 400);
+});
+
+test("venue search retains mapped price and capacity without inventing either", async () => {
+	await withMockedFetch(async () => Response.json({ features: [
+		{ properties: { place_id: "priced", name: "Priced", categories: ["catering.restaurant"], lat: 53.96, lon: -1.08, datasource: { raw: { "price:range": "££", capacity: "50" } } } },
+		{ properties: { place_id: "unknown", name: "Unknown", categories: ["catering.restaurant"], lat: 53.96, lon: -1.08 } },
+	] }), async () => {
+		const response = await app.request("/api/venues?lat=53.96&lon=-1.08&types=food&groupSize=10&radiusKm=5", {}, bindings);
+		const venues = (await response.json()).results.food;
+		assert.equal(venues[0].tags.price, "££");
+		assert.equal(venues[0].tags.capacity, "50");
+		assert.equal(venues[1].tags.price, undefined);
+		assert.equal(venues[1].tags.capacity, undefined);
+	});
+});
+
+test("map-discovered venues can be saved and voted on without losing existing results", async () => {
+	const database = new MemoryD1();
+	const create = await app.request("/api/searches", { method: "POST", body: JSON.stringify(multiCategorySnapshot) }, { DB: database });
+	const { id } = await create.json();
+	const venue = { ...activityVenue, id: "new-map-venue", tags: { name: "Map discovery" } };
+	const post = (body) => app.request(`/api/searches/${id}/shortlist`, { method: "POST", body: JSON.stringify(body) }, { DB: database });
+	assert.equal((await post({ action: "add", venueId: venue.id, entries: [{ type: "activities", venue }, { type: "food", venue }] })).status, 200);
+	assert.equal((await post({ action: "add", venueId: venue.id, entries: [{ type: "activities", venue }] })).status, 200);
+	const saved = await (await app.request(`/api/searches/${id}`, {}, { DB: database })).json();
+	assert.equal(saved.snapshot.results.activities.filter((item) => item.id === venue.id).length, 1);
+	assert.ok(saved.snapshot.results.food.some((item) => item.id === venue.id));
+	assert.ok(saved.snapshot.results.food.some((item) => item.id === "restaurant-1"));
+	const vote = await app.request(`/api/searches/${id}/votes`, { method: "POST", body: JSON.stringify({ venueId: venue.id, category: "food", voterId: "123e4567-e89b-42d3-a456-426614174000", voted: true }) }, { DB: database });
+	assert.equal(vote.status, 200);
+	assert.equal((await post({ action: "add", venueId: "bad", entries: [{ type: "food", venue }] })).status, 400);
 });
 
 test("venue search reports provider outages and malformed results instead of empty results", async () => {

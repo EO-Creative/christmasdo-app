@@ -1,13 +1,16 @@
 import { Hono } from "hono";
-import { parseSearchIntent, type VenueType, type SearchIntent } from "../shared/search-intent.ts";
+import { isSearchIntent, parseSearchIntent, type VenueType, type SearchIntent } from "../shared/search-intent.ts";
+import { inferSearchIntent, type InferenceAi } from "./inference.ts";
+import { getCachedVenueResults } from "./venue-cache.ts";
 
-type WorkerBindings = { GEOAPIFY_API_KEY?: string; DB?: D1Database };
+type WorkerBindings = { GEOAPIFY_API_KEY?: string; DB?: D1Database; AI?: InferenceAi };
 type SearchSnapshot = {
 	location: { label: string; lat: number; lon: number };
 	groupSize: number;
 	radiusKm: number;
 	types: VenueType[];
 	prompt?: string;
+	intent?: SearchIntent;
 	results: Record<VenueType, NormalizedVenue[]>;
 };
 
@@ -41,6 +44,8 @@ interface GeoapifyLocation {
 	formatted?: unknown;
 	lat?: unknown;
 	lon?: unknown;
+	city?: unknown;
+	address_line1?: unknown;
 }
 
 interface GeoapifyPlace extends GeoapifyLocation {
@@ -79,6 +84,13 @@ function locationResult(value: unknown) {
 	};
 }
 
+function primaryLocationName(value: unknown): string {
+	if (!isRecord(value)) return "";
+	const primary = [value.address_line1, value.name, typeof value.formatted === "string" ? value.formatted.split(",")[0] : undefined, value.city]
+		.find((part) => typeof part === "string" && part.trim());
+	return typeof primary === "string" ? primary.trim().toLocaleLowerCase() : "";
+}
+
 function distanceBetween(latitude: number, longitude: number, targetLatitude: number, targetLongitude: number): number {
 	const radians = Math.PI / 180;
 	const latitudeDelta = (targetLatitude - latitude) * radians;
@@ -112,6 +124,7 @@ function venueResult(value: unknown, requestedCategories: string[], latitude: nu
 	const website = place.contact?.website ?? place.website ?? raw.website;
 	const phone = place.contact?.phone ?? place.phone ?? raw.phone;
 	const capacity = raw.capacity;
+	const price = raw["price:range"] ?? raw["charge"];
 
 	return {
 		id: typeof place.place_id === "string" ? place.place_id : `${lat},${lon}`,
@@ -134,6 +147,7 @@ function venueResult(value: unknown, requestedCategories: string[], latitude: nu
 			website: typeof website === "string" ? website : undefined,
 			phone: typeof phone === "string" ? phone : undefined,
 			capacity: typeof capacity === "string" || typeof capacity === "number" ? String(capacity) : undefined,
+			price: typeof price === "string" && price.trim() ? price.trim().slice(0, 200) : undefined,
 		},
 	};
 }
@@ -222,6 +236,7 @@ function validateSnapshot(value: unknown): SearchSnapshot | undefined {
 	if (!isRecord(value) || !isRecord(value.location) || !isRecord(value.results)) return undefined;
 	const { location } = value;
 	if (value.prompt !== undefined && (typeof value.prompt !== "string" || value.prompt.length > 500)) return undefined;
+	if (value.intent !== undefined && !isSearchIntent(value.intent)) return undefined;
 	if (typeof location.label !== "string" || !location.label.trim() || location.label.length > 200) return undefined;
 	if (typeof location.lat !== "number" || typeof location.lon !== "number") return undefined;
 	const latitude = location.lat;
@@ -238,11 +253,11 @@ function validateSnapshot(value: unknown): SearchSnapshot | undefined {
 	const results = {} as Record<VenueType, NormalizedVenue[]>;
 	for (const type of venueTypes) {
 		const venues = value.results[type];
-		if (!Array.isArray(venues) || venues.length > 20 || venues.some((venue) => !isValidVenue(venue))) return undefined;
+		if (!Array.isArray(venues) || venues.length > 200 || venues.some((venue) => !isValidVenue(venue))) return undefined;
 		venueCount += venues.length;
 		results[type] = venues as NormalizedVenue[];
 	}
-	if (venueCount > 60 || venueTypes.some((type) => !types.includes(type) && results[type].length > 0)) return undefined;
+	if (venueCount > 600 || venueTypes.some((type) => !types.includes(type) && results[type].length > 0)) return undefined;
 
 	return {
 		location: { label: location.label.trim(), lat: latitude, lon: longitude },
@@ -250,6 +265,7 @@ function validateSnapshot(value: unknown): SearchSnapshot | undefined {
 		radiusKm: value.radiusKm,
 		types,
 		...(typeof value.prompt === "string" && value.prompt.trim() ? { prompt: value.prompt.trim() } : {}),
+		...(isSearchIntent(value.intent) ? { intent: value.intent } : {}),
 		results,
 	};
 }
@@ -283,7 +299,7 @@ app.get("/api/suggest", async (c) => {
 	}
 
 	try {
-		const params = new URLSearchParams({ apiKey, text, format: "json", limit: "5" });
+		const params = new URLSearchParams({ apiKey, text, format: "json", limit: "5", type: "city" });
 		const response = await fetch(`https://api.geoapify.com/v1/geocode/autocomplete?${params}`, {
 			signal: AbortSignal.timeout(10000),
 		});
@@ -292,7 +308,10 @@ app.get("/api/suggest", async (c) => {
 		if (!data || typeof data !== "object" || !Array.isArray((data as { results?: unknown }).results)) {
 			return c.json({ error: "Location search returned an invalid response." }, 502);
 		}
-		const results = (data as { results: unknown[] }).results.map(locationResult).filter(Boolean);
+		const prefix = text.split(",")[0].trim().toLocaleLowerCase();
+		const ordered = [...(data as { results: unknown[] }).results].sort((a, b) =>
+			Number(primaryLocationName(b).startsWith(prefix)) - Number(primaryLocationName(a).startsWith(prefix)));
+		const results = ordered.map(locationResult).filter(Boolean);
 		return c.json({ results });
 	} catch {
 		return c.json({ error: "Location suggestions are temporarily unavailable." }, 502);
@@ -310,20 +329,45 @@ app.get("/api/geocode", async (c) => {
 	}
 
 	try {
-		const params = new URLSearchParams({ apiKey, text, format: "json", limit: "1" });
-		const response = await fetch(`https://api.geoapify.com/v1/geocode/search?${params}`, {
-			signal: AbortSignal.timeout(10000),
-		});
-		if (!response.ok) return c.json({ error: "Location search is temporarily unavailable. Please try again." }, 502);
-		const data: unknown = await response.json();
-		if (!data || typeof data !== "object" || !Array.isArray((data as { results?: unknown }).results)) {
-			return c.json({ error: "Location search returned an invalid response." }, 502);
-		}
-		const results = (data as { results: unknown[] }).results.map(locationResult).filter(Boolean);
+		const lookup = async (cityOnly: boolean): Promise<unknown[]> => {
+			const params = new URLSearchParams({ apiKey, text, format: "json", limit: cityOnly ? "5" : "1" });
+			if (cityOnly) params.set("type", "city");
+			const response = await fetch(`https://api.geoapify.com/v1/geocode/search?${params}`, { signal: AbortSignal.timeout(10000) });
+			if (!response.ok) throw new Error("unavailable");
+			const data: unknown = await response.json();
+			if (!isRecord(data) || !Array.isArray(data.results)) throw new Error("invalid");
+			return data.results;
+		};
+		const cityResults = await lookup(true);
+		const locality = text.split(",")[0].trim().toLocaleLowerCase();
+		const exactCity = cityResults.find((result) => primaryLocationName(result) === locality && locationResult(result));
+		const candidates = exactCity ? [exactCity] : await lookup(false);
+		const results = candidates.map(locationResult).filter(Boolean);
 		return c.json({ results });
-	} catch {
-		return c.json({ error: "Location search is temporarily unavailable. Please try again." }, 502);
+	} catch (error) {
+		return c.json({ error: error instanceof Error && error.message === "invalid" ? "Location search returned an invalid response." : "Location search is temporarily unavailable. Please try again." }, 502);
 	}
+});
+
+app.post("/api/interpret", async (c) => {
+	let body: unknown;
+	try { body = await c.req.json(); } catch { return c.json({ error: "Description must be valid JSON." }, 400); }
+	if (!isRecord(body) || typeof body.prompt !== "string" || body.prompt.length > 500) {
+		return c.json({ error: "Describe your preferences in 500 characters or fewer." }, 400);
+	}
+	const prompt = body.prompt.trim();
+	let ai: InferenceAi | undefined;
+	if (prompt && c.env.AI && c.env.DB) {
+		try {
+			const day = new Date().toISOString().slice(0, 10);
+			const allowance = await c.env.DB.prepare(`INSERT INTO ai_daily_usage (day, requests) VALUES (?, 1)
+				ON CONFLICT(day) DO UPDATE SET requests = requests + 1 WHERE requests < 100 RETURNING requests`).bind(day).first();
+			if (allowance) ai = c.env.AI;
+		} catch {
+			// If the usage counter is unavailable, do not make an unbounded AI request.
+		}
+	}
+	return c.json(await inferSearchIntent(prompt, ai));
 });
 
 app.get("/api/venues", async (c) => {
@@ -379,9 +423,22 @@ app.get("/api/venues", async (c) => {
 		return c.json({ error: "Venue search is not configured. Add GEOAPIFY_API_KEY to the Worker settings." }, 503);
 	}
 
-	const intent = parseSearchIntent(prompt);
+	let intent = parseSearchIntent(prompt);
+	const intentParam = c.req.query("intent");
+	if (intentParam !== undefined) {
+		try {
+			const parsed: unknown = JSON.parse(intentParam);
+			if (!isSearchIntent(parsed)) return c.json({ error: "Search filters are invalid." }, 400);
+			intent = parsed;
+		} catch {
+			return c.json({ error: "Search filters are invalid." }, 400);
+		}
+	}
 	const selectedCategories = types.flatMap((type) => requestedCategories(type as VenueType, intent));
 	try {
+		const results = await getCachedVenueResults(c.env.DB, {
+			latitude, longitude, radiusKm, groupSize, types: types as VenueType[], filters: intent,
+		}, async () => {
 		const fetchPlaces = async (categories: string[]): Promise<unknown[]> => {
 			const params = new URLSearchParams({
 				apiKey,
@@ -431,6 +488,8 @@ app.get("/api/venues", async (c) => {
 				.sort(sortVenueCandidates)
 				.slice(0, 20);
 		}
+		return results;
+		});
 		return c.json({ results });
 	} catch (error) {
 		if (error instanceof Error && error.message === "Venue search returned an invalid response.") {
@@ -542,7 +601,27 @@ app.post("/api/searches/:id/shortlist", async (c) => {
 	try {
 		const search = await readSearch(c.env.DB, id);
 		if (!search) return c.json({ error: "This shared search could not be found." }, 404);
-		if (!snapshotHasVenue(search.snapshot, body.venueId)) return c.json({ error: "That venue is not part of this search." }, 404);
+		if (body.action === "add" && body.entries !== undefined) {
+			if (!Array.isArray(body.entries) || body.entries.length > venueTypes.length || body.entries.length === 0 ||
+				body.entries.some((entry) => !isRecord(entry) || !search.snapshot.types.includes(entry.type as VenueType) ||
+					!isValidVenue(entry.venue) || entry.venue.id !== body.venueId || JSON.stringify(entry.venue).length > 5000)) {
+				return c.json({ error: "The map venue is invalid." }, 400);
+			}
+			for (const entry of body.entries as { type: VenueType; venue: NormalizedVenue }[]) {
+				const path = `$.results.${entry.type}`;
+				await c.env.DB.prepare(`
+					UPDATE searches SET search_json = json_insert(search_json, ? || '[#]', json(?))
+					WHERE id = ? AND json_array_length(search_json, ?) < 200
+					AND length(search_json) + length(?) < 1000000
+					AND NOT EXISTS (SELECT 1 FROM json_each(search_json, ?) WHERE json_extract(value, '$.id') = ?)
+				`).bind(path, JSON.stringify(entry.venue), id, path, JSON.stringify(entry.venue), path, body.venueId).run();
+			}
+			const updated = await readSearch(c.env.DB, id);
+			if (!updated || body.entries.some((entry) => !updated.snapshot.results[(entry as { type: VenueType }).type].some((venue) => venue.id === body.venueId))) {
+				return c.json({ error: "This shared search has reached its venue limit." }, 409);
+			}
+		}
+		if (!snapshotHasVenue(search.snapshot, body.venueId) && !(body.action === "add" && Array.isArray(body.entries))) return c.json({ error: "That venue is not part of this search." }, 404);
 		if (body.action === "add") {
 			await c.env.DB.prepare("INSERT OR IGNORE INTO shortlist (search_id, venue_id, added_at) VALUES (?, ?, ?)")
 				.bind(id, body.venueId, Date.now()).run();

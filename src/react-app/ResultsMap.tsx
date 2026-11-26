@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as L from "leaflet";
 import "leaflet/dist/leaflet.css";
-import { getVenueCoordinates, groupMapVenues, type MapVenue, type MapVenueEntry, type VenueType } from "./map-utils";
+import { filterMapVenuesInBounds, groupMapVenues, isCoordinateInBounds, normalizeLongitude, type MapBounds, type MapCoordinates, type MapVenue, type MapVenueEntry, type VenueType } from "./map-utils";
 
 const venueTypeLabels: Record<VenueType, string> = {
 	activities: "Activities",
@@ -9,10 +9,11 @@ const venueTypeLabels: Record<VenueType, string> = {
 	drinks: "Drinks",
 };
 
-interface ResultsMapProps<TVenue extends MapVenue> {
+export interface ResultsMapProps<TVenue extends MapVenue> {
 	venues: MapVenueEntry<TVenue>[];
-	center: { lat: number; lon: number };
+	center: MapCoordinates;
 	renderVenueCard: (venue: TVenue, type: VenueType) => ReactNode;
+	onViewportChange?: (center: MapCoordinates, bounds: MapBounds) => void;
 }
 
 interface MapMarker {
@@ -23,15 +24,23 @@ interface MapMarker {
 	categoryTypes: VenueType[];
 }
 
-export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenueCard }: ResultsMapProps<TVenue>) {
+function getMapBounds(map: L.Map): MapBounds {
+	const bounds = map.getBounds();
+	return { south: bounds.getSouth(), north: bounds.getNorth(), west: bounds.getWest(), east: bounds.getEast() };
+}
+
+export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenueCard, onViewportChange }: ResultsMapProps<TVenue>) {
 	const mapElement = useRef<HTMLDivElement>(null);
 	const mapRef = useRef<L.Map | null>(null);
 	const markerLayerRef = useRef<L.LayerGroup | null>(null);
-	const markerElementsRef = useRef(new Map<string, HTMLElement>());
-	const closeButtonRef = useRef<HTMLButtonElement>(null);
+	const markersRef = useRef(new Map<string, { marker: L.Marker; lat: number; lon: number }>());
+	const panelEntriesRef = useRef(new Map<string, HTMLElement>());
+	const initialCenter = useRef(center);
+	const viewportCallback = useRef(onViewportChange);
+	const [bounds, setBounds] = useState<MapBounds | null>(null);
 	const [selection, setSelection] = useState<{ key: string } | null>(null);
 	const groups = useMemo(() => groupMapVenues(venues), [venues]);
-	const selectedGroup = groups.find((group) => group.key === selection?.key);
+	const visibleGroups = useMemo(() => bounds ? groupMapVenues(filterMapVenuesInBounds(venues, bounds)) : [], [venues, bounds]);
 	const markerData = JSON.stringify(groups.map((group) => ({
 		key: group.key,
 		lat: group.lat,
@@ -39,25 +48,15 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 		names: [...new Set(group.entries.map(({ venue }) => venue.tags.name || "Unnamed venue"))].sort(),
 		categoryTypes: [...group.categoryTypes].sort(),
 	})).sort((a, b) => a.key.localeCompare(b.key)));
-	const coordinateData = JSON.stringify(venues.flatMap(({ venue }) => {
-		const coordinates = getVenueCoordinates(venue);
-		return coordinates ? [[coordinates.lat, coordinates.lon]] : [];
-	}).sort((a, b) => a[0] - b[0] || a[1] - b[1])
-		.filter((point, index, points) => index === 0 || point[0] !== points[index - 1][0] || point[1] !== points[index - 1][1]));
-
-	const closeFlyover = () => {
-		if (selection) markerElementsRef.current.get(selection.key)?.focus();
-		setSelection(null);
-	};
 
 	useEffect(() => {
-		if (selection) closeButtonRef.current?.focus();
-	}, [selection]);
+		viewportCallback.current = onViewportChange;
+	}, [onViewportChange]);
 
 	useEffect(() => {
 		if (!mapElement.current) return;
 
-		const map = L.map(mapElement.current, { scrollWheelZoom: false }).setView([center.lat, center.lon], 13);
+		const map = L.map(mapElement.current, { scrollWheelZoom: false, trackResize: false }).setView([initialCenter.current.lat, initialCenter.current.lon], 13);
 		L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 			maxZoom: 19,
 			attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
@@ -65,16 +64,56 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 		const markerLayer = L.layerGroup().addTo(map);
 		mapRef.current = map;
 		markerLayerRef.current = markerLayer;
-		map.on("click", () => setSelection(null));
-		const frame = window.requestAnimationFrame(() => map.invalidateSize());
+		const markers = markersRef.current;
+		let timer: number | undefined;
+		let resizing = false;
+		const updateViewport = () => {
+			const mapCenter = map.getCenter();
+			const currentBounds = getMapBounds(map);
+			for (const { marker, lat, lon } of markersRef.current.values()) {
+				const nearestLon = lon + 360 * Math.round((mapCenter.lng - lon) / 360);
+				if (marker.getLatLng().lng !== nearestLon) marker.setLatLng([lat, nearestLon]);
+				const element = marker.getElement();
+				if (element) element.tabIndex = isCoordinateInBounds({ lat, lon }, currentBounds) ? 0 : -1;
+			}
+			setBounds(currentBounds);
+		};
+		const moveStart = () => {
+			if (!resizing) window.clearTimeout(timer);
+		};
+		const moveEnd = () => {
+			updateViewport();
+			if (resizing) return;
+			window.clearTimeout(timer);
+			timer = window.setTimeout(() => {
+				const mapCenter = map.getCenter();
+				viewportCallback.current?.({ lat: mapCenter.lat, lon: normalizeLongitude(mapCenter.lng) }, getMapBounds(map));
+			}, 400);
+		};
+		map.on("movestart", moveStart);
+		map.on("move", updateViewport);
+		map.on("moveend", moveEnd);
+		const resize = () => {
+			resizing = true;
+			map.invalidateSize({ pan: false });
+			updateViewport();
+			resizing = false;
+		};
+		const observer = new ResizeObserver(resize);
+		observer.observe(mapElement.current);
+		const frame = window.requestAnimationFrame(resize);
+		updateViewport();
 
 		return () => {
+			window.clearTimeout(timer);
 			window.cancelAnimationFrame(frame);
+			observer.disconnect();
 			map.remove();
 			mapRef.current = null;
 			markerLayerRef.current = null;
+			markers.clear();
 		};
-	}, [center.lat, center.lon]);
+	}, []);
 
 	useEffect(() => {
 		const map = mapRef.current;
@@ -82,7 +121,7 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 		if (!map || !markerLayer) return;
 
 		markerLayer.clearLayers();
-		markerElementsRef.current.clear();
+		markersRef.current.clear();
 		for (const group of JSON.parse(markerData) as MapMarker[]) {
 			const title = `${group.names.join(", ")} · ${group.categoryTypes.map((type) => venueTypeLabels[type]).join(", ")}`;
 			const tooltip = document.createElement("span");
@@ -96,7 +135,8 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 				iconSize: [38, 38],
 				iconAnchor: [19, 19],
 			});
-			const marker = L.marker([group.lat, group.lon], { icon, keyboard: true, title, alt: title })
+			const lon = group.lon + 360 * Math.round((map.getCenter().lng - group.lon) / 360);
+			const marker = L.marker([group.lat, lon], { icon, keyboard: true, autoPanOnFocus: false, title, alt: title })
 				.addTo(markerLayer)
 				.bindTooltip(tooltip);
 			const selectMarker = () => setSelection({ key: group.key });
@@ -111,20 +151,21 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 						selectMarker();
 					}
 				});
-				markerElementsRef.current.set(group.key, element);
+				element.tabIndex = isCoordinateInBounds({ lat: group.lat, lon: group.lon }, getMapBounds(map)) ? 0 : -1;
 			}
+			markersRef.current.set(group.key, { marker, lat: group.lat, lon: group.lon });
 		}
-	}, [center.lat, center.lon, markerData]);
+	}, [markerData]);
 
 	useEffect(() => {
-		const map = mapRef.current;
-		if (!map) return;
+		if (!selection) return;
+		const entry = panelEntriesRef.current.get(selection.key);
+		if (entry) {
+			entry.scrollIntoView({ block: "nearest", inline: "nearest" });
+			entry.focus({ preventScroll: true });
+		}
+	}, [selection]);
 
-		const bounds = L.latLngBounds([[center.lat, center.lon]]);
-		for (const [lat, lon] of JSON.parse(coordinateData) as [number, number][]) bounds.extend([lat, lon]);
-		if (bounds.getNorthEast().equals(bounds.getSouthWest())) map.setView([center.lat, center.lon], 13);
-		else map.fitBounds(bounds.pad(0.18), { maxZoom: 14 });
-	}, [center.lat, center.lon, coordinateData]);
 	return (
 		<div className="results-map-panel">
 			<div className="map-legend" aria-label="Map marker categories">
@@ -135,32 +176,31 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 					</span>
 				))}
 			</div>
-			<p className="map-help">Select a marker to see venues at that location. Use Enter or Space on a marker, and Escape to close the details.</p>
-			<div className="results-map-wrapper" onKeyDown={(event) => {
-				if (event.key === "Escape" && selectedGroup) {
-					event.stopPropagation();
-					closeFlyover();
-				}
-			}}>
+			<p className="map-help">Move the map to update the visible venues. Select a marker with a click, Enter, or Space to find its cards.</p>
+			<div className="results-map-wrapper">
 				<div className="results-map" ref={mapElement} role="region" aria-label="Interactive map of venue results" />
-				{selectedGroup && (
-					<section className="map-selected-venues" aria-labelledby="map-selected-heading">
-						<div className="map-selected-header">
-							<h3 id="map-selected-heading">Venues at this location</h3>
-							<button type="button" className="map-close-button" ref={closeButtonRef} onClick={closeFlyover} aria-label="Close venue details" aria-describedby="map-selected-heading">×</button>
-						</div>
-						<div className="map-selected-content venue-list">
-							{selectedGroup.entries.map(({ venue, type }) => (
-								<div key={`${type}-${venue.id}`}>
-									<p className="map-venue-category">{venueTypeLabels[type]}</p>
-									{renderVenueCard(venue, type)}
-								</div>
-							))}
-						</div>
-					</section>
-				)}
+				<section className="map-visible-venues" aria-labelledby="map-visible-heading">
+					<div className="map-visible-header">
+						<h3 id="map-visible-heading">Venues in this map area</h3>
+						<p aria-live="polite">{bounds ? `${visibleGroups.reduce((count, group) => count + group.entries.length, 0)} results` : "Loading map…"}</p>
+					</div>
+					<div className="map-visible-content">
+						{bounds && visibleGroups.length === 0 && <p className="category-empty">No venues in this map area. Move or zoom the map to explore.</p>}
+						{visibleGroups.map((group) => (
+							<div key={group.key} className={`map-location${selection?.key === group.key ? " selected" : ""}`} role="group" tabIndex={-1}
+								aria-label={`Venues at ${[...new Set(group.entries.map(({ venue }) => venue.tags.name || "Unnamed venue"))].join(", ")}`}
+								ref={(element) => { if (element) panelEntriesRef.current.set(group.key, element); else panelEntriesRef.current.delete(group.key); }}>
+								{group.entries.map(({ venue, type }) => (
+									<div key={`${type}-${venue.id}`}>
+										<p className="map-venue-category">{venueTypeLabels[type]}</p>
+										{renderVenueCard(venue, type)}
+									</div>
+								))}
+							</div>
+						))}
+					</div>
+				</section>
 			</div>
-			{!groups.length && <p className="category-empty">No venues with valid map coordinates. Use list view to review the results.</p>}
 		</div>
 	);
 }
