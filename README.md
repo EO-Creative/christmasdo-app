@@ -1,12 +1,18 @@
 # Christmas Night Out Venue Finder
 
-A small React app that helps an office group shortlist potential venues for a Christmas night out. Search by a suggested town or city, enter the group size, choose a search radius, and select any combination of activities, food, and drinks.
+A small React app that helps an office group shortlist potential venues for a Christmas night out. Describe the evening you have in mind, then set the location, group size, and search radius. The app suggests separate activity, food, and drinks searches; you can adjust the category choices before searching.
 
 Results are split into separate lists for each selected type, each containing up to 20 Geoapify places within the chosen 1, 2, 5, 10, or 20 km radius. This allows a popular category to have its own results rather than crowding out the others. Geoapify does not provide dependable customer ratings for these listings, so each list is ordered by listed capacity suitability and then distance; no rating is fabricated. Food searches focus on restaurants rather than cafés and food courts; obvious café and fast-food brands or classifications are filtered. Listings with a numeric capacity below the submitted group size are omitted. These are practical heuristics, not a group-booking guarantee.
 
 Each completed search is saved as a snapshot and given a shareable URL. The shared shortlist and its category-by-category votes appear before the search form on a shared link. Anyone with the link can add/remove venues from the shared shortlist and vote; each browser identity can select one shortlisted venue per selected category, and can change that choice. Changes refresh automatically about every 30 seconds, or can be refreshed manually. The snapshot does not change when a provider's listings change; run a new search to create an updated share link.
 
 Address, phone, website, and capacity information may be missing, incomplete, or out of date. Confirm details and availability with venues directly. Place lookup is powered by [Geoapify](https://www.geoapify.com/); map links and the optional interactive map use [OpenStreetMap](https://www.openstreetmap.org/copyright).
+
+## Conversational search
+
+The prompt interpreter uses deterministic phrase matching, not an unrestricted language model. It recognizes common activity types and supported cuisine names (including Lebanese) and uses Geoapify's corresponding place categories to narrow those result lists. It also suggests the broad Activities, Food, and Drinks lists from phrases in the request; users can change those checkboxes before searching. Unrecognized wording does not invent a category.
+
+Some preferences cannot be checked in the available map data. Indoor status, specific beer/wine menus, and budget or price range are called out as unverified, and results should be confirmed with venues. Search prompts are limited to 500 characters and saved in the shareable search snapshot; do not include personal or confidential details.
 
 ## Requirements
 
@@ -43,6 +49,7 @@ npm run build
 
 - Location autocomplete and forward geocoding use Geoapify's [Geocoding API](https://apidocs.geoapify.com/docs/geocoding/address-autocomplete/); nearby venue search uses its [Places API](https://apidocs.geoapify.com/docs/places/).
 - The current Geoapify Free plan includes 3,000 shared credits per day and does not require a credit card. Autocomplete and geocoding each use 1 credit per request; each selected category gets an independent Places request for up to 100 nearby candidates (up to 5 credits per request, or 15 for all three categories) so filtering one type cannot hide another. Autocomplete waits until at least three characters have been typed and debounces requests.
+- Conversational activity and cuisine matches narrow the corresponding independent Places request to supported Geoapify categories (for example, sports centres/halls or Lebanese restaurants). Generic searches still use the broad category list; indoor status, beverage menus, and prices are not verified.
 - Geoapify's credit allowances and prices can change. Review the [current pricing](https://www.geoapify.com/pricing/) and usage in your Geoapify account; no Google Maps service is used.
 - Search results default to the familiar category lists and can be switched to an interactive map. Activity, Food, and Drink markers have distinct colors; co-located venues share a marker that shows every applicable category, and selecting it reveals the venue cards and shortlist/vote actions.
 - Interactive map tiles are requested from OpenStreetMap's public tile service only when Map view is opened. Attribution is shown on the map; tiles are a third-party service with its own usage policy and availability limits, and are not covered by Geoapify's free credits. Avoid bulk tile downloads or prefetching; list view remains available if map tiles cannot load.

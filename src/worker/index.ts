@@ -1,12 +1,13 @@
 import { Hono } from "hono";
+import { parseSearchIntent, type VenueType, type SearchIntent } from "../shared/search-intent.ts";
 
 type WorkerBindings = { GEOAPIFY_API_KEY?: string; DB?: D1Database };
-type VenueType = "activities" | "food" | "drinks";
 type SearchSnapshot = {
 	location: { label: string; lat: number; lon: number };
 	groupSize: number;
 	radiusKm: number;
 	types: VenueType[];
+	prompt?: string;
 	results: Record<VenueType, NormalizedVenue[]>;
 };
 
@@ -27,6 +28,12 @@ const categoriesByType: Record<VenueType, string[]> = {
 };
 const filteredFoodCategories = ["catering.cafe", "catering.fast_food", "catering.food_court"];
 const unsuitableVenueName = /\b(?:costa(?:\s+(?:coffee|express))?|starbucks|caff[eè]?\s*nero|nero|pret(?:\s+a)?\s+manger|greggs|tim\s+hortons|mcdonald[’']?s|burger\s+king|kfc|subway|taco\s+bell|pizza\s+hut|domino[’']?s|papa\s+john[’']s)\b/i;
+
+function requestedCategories(type: VenueType, intent: SearchIntent): string[] {
+	if (type === "activities" && intent.activityCategories.length > 0) return intent.activityCategories;
+	if (type === "food" && intent.cuisineCategories.length > 0) return intent.cuisineCategories;
+	return categoriesByType[type];
+}
 
 interface GeoapifyLocation {
 	place_id?: unknown;
@@ -193,6 +200,7 @@ function isValidVenue(value: unknown): value is NormalizedVenue {
 function validateSnapshot(value: unknown): SearchSnapshot | undefined {
 	if (!isRecord(value) || !isRecord(value.location) || !isRecord(value.results)) return undefined;
 	const { location } = value;
+	if (value.prompt !== undefined && (typeof value.prompt !== "string" || value.prompt.length > 500)) return undefined;
 	if (typeof location.label !== "string" || !location.label.trim() || location.label.length > 200) return undefined;
 	if (typeof location.lat !== "number" || typeof location.lon !== "number") return undefined;
 	const latitude = location.lat;
@@ -220,6 +228,7 @@ function validateSnapshot(value: unknown): SearchSnapshot | undefined {
 		groupSize: Number(value.groupSize),
 		radiusKm: value.radiusKm,
 		types,
+		...(typeof value.prompt === "string" && value.prompt.trim() ? { prompt: value.prompt.trim() } : {}),
 		results,
 	};
 }
@@ -302,6 +311,8 @@ app.get("/api/venues", async (c) => {
 	const typeParam = c.req.query("types");
 	const groupSizeParam = c.req.query("groupSize");
 	const radiusParam = c.req.query("radiusKm");
+	const prompt = c.req.query("prompt")?.trim() ?? "";
+	if (prompt.length > 500) return c.json({ error: "Describe your preferences in 500 characters or fewer." }, 400);
 
 	if (lat === undefined || lon === undefined) {
 		return c.json({ error: "A location is required before searching for venues." }, 400);
@@ -347,10 +358,11 @@ app.get("/api/venues", async (c) => {
 		return c.json({ error: "Venue search is not configured. Add GEOAPIFY_API_KEY to the Worker settings." }, 503);
 	}
 
-	const selectedCategories = types.flatMap((type) => categoriesByType[type as VenueType]);
+	const intent = parseSearchIntent(prompt);
+	const selectedCategories = types.flatMap((type) => requestedCategories(type as VenueType, intent));
 	try {
 		const categoryResults = await Promise.all(types.map(async (type) => {
-			const categories = categoriesByType[type as VenueType];
+			const categories = requestedCategories(type as VenueType, intent);
 			const params = new URLSearchParams({
 				apiKey,
 				categories: categories.join(","),

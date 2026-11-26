@@ -2,9 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { getCapacityStatus, sortVenuesBySuitability } from "./venue-utils";
 import { ResultsMap } from "./ResultsMap";
 import type { VenueType as MapVenueType } from "./map-utils";
+import { parseSearchIntent, type VenueType } from "../shared/search-intent.ts";
 import "./App.css";
-
-type VenueType = "activities" | "food" | "drinks";
 
 interface Venue {
 	id: string;
@@ -45,6 +44,7 @@ interface SearchSnapshot {
 	groupSize: number;
 	radiusKm: number;
 	types: VenueType[];
+	prompt?: string;
 	results: Record<VenueType, Venue[]>;
 }
 
@@ -115,6 +115,8 @@ function safeWebsiteUrl(value: string): string | undefined {
 }
 
 function App() {
+	const [prompt, setPrompt] = useState("");
+	const [searchedPrompt, setSearchedPrompt] = useState("");
 	const [location, setLocation] = useState("");
 	const [selectedLocation, setSelectedLocation] = useState<GeocodingResult>();
 	const [suggestions, setSuggestions] = useState<GeocodingResult[]>([]);
@@ -142,10 +144,14 @@ function App() {
 	const [resultsView, setResultsView] = useState<"list" | "map">("list");
 	const [error, setError] = useState("");
 	const [shareError, setShareError] = useState("");
+	const promptIntent = useMemo(() => parseSearchIntent(prompt), [prompt]);
+	const searchedIntent = useMemo(() => parseSearchIntent(searchedPrompt), [searchedPrompt]);
 
 	const applySharedSearch = useCallback((shared: SharedSearchResponse) => {
 		const snapshot = shared.snapshot;
 		setShareId(shared.id);
+		setPrompt(snapshot.prompt ?? "");
+		setSearchedPrompt(snapshot.prompt ?? "");
 		setLocation(snapshot.location.label);
 		setSelectedLocation({
 			id: snapshot.location.label,
@@ -253,6 +259,16 @@ function App() {
 		setTypes((prev) => ({ ...prev, [type]: !prev[type] }));
 	};
 
+	const handlePromptChange = (value: string) => {
+		setPrompt(value);
+		const inferredTypes = parseSearchIntent(value).types;
+		setTypes({
+			activities: inferredTypes.includes("activities"),
+			food: inferredTypes.includes("food"),
+			drinks: inferredTypes.includes("drinks"),
+		});
+	};
+
 	const selectLocation = (place: GeocodingResult) => {
 		setLocation(place.label);
 		setSelectedLocation(place);
@@ -290,6 +306,7 @@ function App() {
 		setHasSearched(true);
 		setSuggestionsOpen(false);
 		window.history.replaceState(null, "", window.location.pathname);
+		const submittedPrompt = prompt.trim();
 
 		const requestedGroupSize = Number(groupSize);
 		if (!Number.isSafeInteger(requestedGroupSize) || requestedGroupSize < 1 || requestedGroupSize > 10000) {
@@ -329,6 +346,7 @@ function App() {
 				types: selectedTypes.join(","),
 				groupSize: String(requestedGroupSize),
 				radiusKm: String(radiusKm),
+				prompt: submittedPrompt,
 			});
 			const venueData = await requestJson<VenueSearchResponse>(`/api/venues?${params}`);
 			const groupedResults = Object.fromEntries(venueTypes.map((type) => {
@@ -350,8 +368,10 @@ function App() {
 				groupSize: requestedGroupSize,
 				radiusKm,
 				types: selectedTypes,
+				prompt: submittedPrompt || undefined,
 				results: groupedResults,
 			};
+			setSearchedPrompt(submittedPrompt);
 			setSearchedLocation(snapshot.location.label);
 			setSearchedRadiusKm(snapshot.radiusKm);
 			setSearchedTypes(snapshot.types);
@@ -582,6 +602,39 @@ function App() {
 						<h2 id="search-title">What does your group have in mind?</h2>
 					</div>
 					<form onSubmit={searchVenues} className="search-form">
+						<div className="form-group prompt-field">
+							<label htmlFor="searchPrompt">Describe the night you’re planning</label>
+							<textarea
+								id="searchPrompt"
+								value={prompt}
+								onChange={(event) => handlePromptChange(event.target.value)}
+								maxLength={500}
+								aria-describedby="prompt-hint prompt-interpretation"
+								placeholder="e.g. Indoor sports activities with options for beer and wine, a mid-range budget, and some Lebanese food"
+							/>
+							<p className="field-hint" id="prompt-hint">
+								Tell us what you’d enjoy; choose the search location and group size below. Up to 500 characters.
+							</p>
+							<div className="search-interpretation" id="prompt-interpretation" aria-live="polite">
+								{prompt.trim() ? (
+									<>
+										<p>
+											<strong>Suggested categories:</strong>{" "}
+											{promptIntent.types.length
+												? promptIntent.types.map((type) => venueTypeLabels[type]).join(", ")
+												: "none recognized yet; choose categories below for a broad search"}
+											. You can edit these choices.
+										</p>
+								{promptIntent.details.length > 0 && <p>Specific filters (if their category is selected): {promptIntent.details.join(", ")}.</p>}
+										{promptIntent.limitations.length > 0 && (
+											<ul>
+												{promptIntent.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
+											</ul>
+										)}
+									</>
+								) : <p>Supported activity and cuisine phrases can narrow results; you can also choose categories below.</p>}
+							</div>
+						</div>
 						<div className="input-row">
 							<div className="form-group location-field">
 								<label htmlFor="location">Suggested location</label>
@@ -663,8 +716,8 @@ function App() {
 						</div>
 
 						<fieldset className="form-group type-fieldset">
-							<legend>Choose what to include</legend>
-							<p className="field-hint">Select one, a few, or all three.</p>
+							<legend>Search separately for</legend>
+							<p className="field-hint">Suggested by your request; adjust these lists as needed.</p>
 							<div className="checkbox-group">
 								{(Object.keys(venueTypeLabels) as Array<keyof typeof venueTypeLabels>).map((type) => (
 									<label className="type-option" key={type}>
@@ -684,6 +737,7 @@ function App() {
 							{loading ? "Searching nearby places…" : "Find venues"}
 							<span aria-hidden="true">→</span>
 						</button>
+						<p className="privacy-note">Your request is saved with the shareable search, so avoid personal or confidential details.</p>
 						<p className="privacy-note">Geoapify’s free plan requires an API key; searches use daily credits.</p>
 					</form>
 				</section>
@@ -717,6 +771,12 @@ function App() {
 								Showing separate lists for {selectedLabels.join(", ")}. Geoapify does not provide dependable customer ratings for these listings, so venues are ordered by listed capacity suitability and distance.
 								Known capacities below {searchedGroupSize} are omitted. Details may be incomplete; confirm group bookings directly.
 							</p>
+							{searchedPrompt && <p className="results-request">Your request: {searchedPrompt}</p>}
+							{searchedIntent.limitations.length > 0 && (
+								<ul className="results-limitations" aria-label="Preferences not verified by place data">
+									{searchedIntent.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
+								</ul>
+							)}
 							{!shareId && shareError && <p className="share-warning" role="status">Results are shown, but sharing is currently unavailable.</p>}
 							{resultsView === "map" && searchedCoordinates ? (
 								<ResultsMap

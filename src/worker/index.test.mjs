@@ -210,6 +210,7 @@ test("venue search rejects invalid coordinates and unsupported or missing types"
 		"/api/venues?lat=0&lon=0&types=shopping&groupSize=10&radiusKm=5",
 		"/api/venues?lat=0&lon=0&types=food&groupSize=10&radiusKm=3",
 		"/api/venues?lat=0&lon=0&types=food,food&groupSize=10&radiusKm=5",
+		`/api/venues?lat=0&lon=0&types=food&groupSize=10&radiusKm=5&prompt=${"x".repeat(501)}`,
 	];
 	for (const request of invalidRequests) {
 		assert.equal((await app.request(request)).status, 400);
@@ -331,6 +332,41 @@ test("venue results remain in their independently selected category lists", asyn
 		assert.deepEqual(results.drinks.map((venue) => venue.tags.name), ["York Pub"]);
 		assert.deepEqual(results.activities.map((venue) => venue.tags.name), ["Escape Venue"]);
 	});
+});
+
+test("venue search interprets sports and cuisine preferences as supported Geoapify categories", async () => {
+	const queriedCategories = [];
+	await withMockedFetch(async (input) => {
+		const url = new URL(String(input));
+		const categories = url.searchParams.get("categories").split(",");
+		queriedCategories.push(categories);
+		const place = categories.includes("sport.sports_centre")
+			? { place_id: "sports-centre", name: "Sports Centre", categories: ["sport.sports_centre"] }
+			: categories.includes("catering.restaurant.lebanese")
+				? { place_id: "lebanese", name: "Lebanese Kitchen", categories: ["catering.restaurant.lebanese"] }
+				: { place_id: "pub", name: "Local Pub", categories: ["catering.pub"] };
+		return Response.json({ features: [{ properties: { ...place, lat: 53.96, lon: -1.08 } }] });
+	}, async () => {
+		const params = new URLSearchParams({
+			lat: "53.96",
+			lon: "-1.08",
+			types: "activities,food,drinks",
+			groupSize: "10",
+			radiusKm: "5",
+			prompt: "Indoor sports activities with options for beer and wine at a midrange budget and some Lebanese food",
+		});
+		const response = await app.request(`/api/venues?${params}`, {}, bindings);
+		assert.equal(response.status, 200);
+		const { results } = await response.json();
+		assert.deepEqual(results.activities.map((venue) => venue.tags.name), ["Sports Centre"]);
+		assert.deepEqual(results.food.map((venue) => venue.tags.name), ["Lebanese Kitchen"]);
+		assert.deepEqual(results.drinks.map((venue) => venue.tags.name), ["Local Pub"]);
+	});
+	assert.deepEqual(queriedCategories, [
+		["sport.sports_centre", "sport.sports_hall", "sport.ice_rink", "entertainment.bowling_alley"],
+		["catering.restaurant.lebanese"],
+		["catering.bar", "catering.biergarten", "catering.pub", "adult.nightclub"],
+	]);
 });
 
 test("single-category venue searches only request relevant provider categories and allow empty results", async () => {
@@ -459,6 +495,8 @@ test("shared-search creation validates snapshots and requires D1", async () => {
 		{ ...testSnapshot, location: { ...testSnapshot.location, lat: 100 } },
 		{ ...testSnapshot, location: { ...testSnapshot.location, lat: null } },
 		{ ...testSnapshot, types: [] },
+		{ ...testSnapshot, prompt: "x".repeat(501) },
+		{ ...testSnapshot, prompt: 123 },
 		{ ...testSnapshot, results: { ...testSnapshot.results, food: [{ id: "invalid", tags: { name: "" } }] } },
 		{ ...testSnapshot, results: { ...testSnapshot.results, food: [{ ...testSnapshot.results.food[0], tags: { name: "Venue", website: {} } }] } },
 	]) {
@@ -468,6 +506,26 @@ test("shared-search creation validates snapshots and requires D1", async () => {
 			body: JSON.stringify(snapshot),
 		}, { DB: database });
 		assert.equal(response.status, 400);
+	}
+});
+
+test("shared snapshots preserve prompts and continue accepting older prompt-free snapshots", async () => {
+	const database = new MemoryD1();
+	for (const [snapshot, expectedPrompt] of [
+		[{ ...testSnapshot, prompt: "Lebanese food and sports" }, "Lebanese food and sports"],
+		[testSnapshot, undefined],
+	]) {
+		const create = await app.request("/api/searches", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(snapshot),
+		}, { DB: database });
+		assert.equal(create.status, 201);
+		const { id } = await create.json();
+		const shared = await app.request(`/api/searches/${id}`, {}, { DB: database });
+		const { snapshot: savedSnapshot } = await shared.json();
+		assert.equal(savedSnapshot.prompt, expectedPrompt);
+		if (expectedPrompt === undefined) assert.equal(Object.hasOwn(savedSnapshot, "prompt"), false);
 	}
 });
 
