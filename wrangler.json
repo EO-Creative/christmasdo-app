@@ -8,6 +8,14 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "christmasdo-db",
+			"database_id": "00000000-0000-0000-0000-000000000001",
+			"migrations_dir": "migrations"
+		}
+	],
 	"assets": {
 		"directory": "./dist/client",
 		"not_found_handling": "single-page-application"

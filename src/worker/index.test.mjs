@@ -4,6 +4,89 @@ import app from "./index.ts";
 
 const bindings = { GEOAPIFY_API_KEY: "test-api-key" };
 
+class MemoryD1 {
+	searches = new Map();
+	shortlist = new Map();
+	votes = new Map();
+
+	prepare(query) {
+		return {
+			bind: (...values) => ({
+				first: async () => this.first(query, values),
+				all: async () => ({ results: this.all(query, values) }),
+				run: async () => this.run(query, values),
+			}),
+		};
+	}
+
+	first(query, values) {
+		if (query.includes("SELECT search_json, created_at FROM searches")) {
+			const search = this.searches.get(values[0]);
+			return search && { search_json: search.json, created_at: search.createdAt };
+		}
+		if (query.includes("SELECT venue_id FROM shortlist")) {
+			return this.shortlist.has(`${values[0]}:${values[1]}`) ? { venue_id: values[1] } : null;
+		}
+		return null;
+	}
+
+	all(query, values) {
+		if (!query.includes("SELECT s.venue_id, s.added_at")) return [];
+		const voterId = values[0];
+		const searchId = values[1];
+		return [...this.shortlist.entries()]
+			.filter(([key]) => key.startsWith(`${searchId}:`))
+			.map(([key, addedAt]) => {
+				const venueId = key.slice(searchId.length + 1);
+				const venueVotes = [...this.votes.entries()].filter(([voteKey]) => voteKey.startsWith(`${searchId}:${venueId}:`));
+				return {
+					venue_id: venueId,
+					added_at: addedAt,
+					vote_count: venueVotes.length,
+					voted_by_me: venueVotes.some(([voteKey]) => voteKey.endsWith(`:${voterId}`)) ? 1 : 0,
+				};
+			})
+			.sort((first, second) => second.vote_count - first.vote_count || first.added_at - second.added_at);
+	}
+
+	run(query, values) {
+		if (query.includes("INSERT INTO searches")) {
+			this.searches.set(values[0], { createdAt: values[1], json: values[2] });
+		} else if (query.includes("INSERT OR IGNORE INTO shortlist")) {
+			this.shortlist.set(`${values[0]}:${values[1]}`, values[2]);
+		} else if (query.includes("DELETE FROM shortlist")) {
+			const key = `${values[0]}:${values[1]}`;
+			this.shortlist.delete(key);
+			for (const voteKey of this.votes.keys()) if (voteKey.startsWith(`${key}:`)) this.votes.delete(voteKey);
+		} else if (query.includes("INSERT OR IGNORE INTO votes")) {
+			this.votes.set(`${values[0]}:${values[1]}:${values[2]}`, values[3]);
+		} else if (query.includes("DELETE FROM votes")) {
+			this.votes.delete(`${values[0]}:${values[1]}:${values[2]}`);
+		}
+		return { success: true };
+	}
+}
+
+const testSnapshot = {
+	location: { label: "York, UK", lat: 53.96, lon: -1.08 },
+	groupSize: 10,
+	radiusKm: 5,
+	types: ["food"],
+	results: {
+		activities: [],
+		food: [{
+			id: "restaurant-1",
+			type: "node",
+			lat: 53.96,
+			lon: -1.08,
+			category: "restaurant",
+			distance: 100,
+			tags: { name: "Test Restaurant" },
+		}],
+		drinks: [],
+	},
+};
+
 async function withMockedFetch(mockFetch, action) {
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = mockFetch;
@@ -95,13 +178,16 @@ test("geocoding reports upstream and malformed-response errors", async () => {
 
 test("venue search rejects invalid coordinates and unsupported or missing types", async () => {
 	const invalidRequests = [
-		"/api/venues?lat=91&lon=0&types=food&groupSize=10",
+		"/api/venues?lat=91&lon=0&types=food&groupSize=10&radiusKm=5",
 		"/api/venues?lat=0&lon=0&types=food",
-		"/api/venues?lat=0&lon=0&types=food&groupSize=0",
-		"/api/venues?lat=0&lon=0&types=food&groupSize=10.5",
-		"/api/venues?lat=0&lon=0&types=food&groupSize=100000000000000000000",
+		"/api/venues?lat=0&lon=0&types=food&groupSize=0&radiusKm=5",
+		"/api/venues?lat=0&lon=0&types=food&groupSize=10001&radiusKm=5",
+		"/api/venues?lat=0&lon=0&types=food&groupSize=10.5&radiusKm=5",
+		"/api/venues?lat=0&lon=0&types=food&groupSize=100000000000000000000&radiusKm=5",
 		"/api/venues?lat=0&lon=0",
-		"/api/venues?lat=0&lon=0&types=shopping&groupSize=10",
+		"/api/venues?lat=0&lon=0&types=shopping&groupSize=10&radiusKm=5",
+		"/api/venues?lat=0&lon=0&types=food&groupSize=10&radiusKm=3",
+		"/api/venues?lat=0&lon=0&types=food,food&groupSize=10&radiusKm=5",
 	];
 	for (const request of invalidRequests) {
 		assert.equal((await app.request(request)).status, 400);
@@ -112,28 +198,26 @@ test("venue search requires the Worker key", async () => {
 	await withMockedFetch(async () => {
 		assert.fail("The upstream service should not be called without a key");
 	}, async () => {
-		const response = await app.request("/api/venues?lat=0&lon=0&types=food&groupSize=10", {}, {});
+		const response = await app.request("/api/venues?lat=0&lon=0&types=food&groupSize=10&radiusKm=5", {}, {});
 		assert.equal(response.status, 503);
 		assert.match((await response.json()).error, /GEOAPIFY_API_KEY/);
 	});
 });
 
-test("venue search requests nearby Geoapify categories and normalizes venue details", async () => {
+test("venue search requests a separate radius-bounded query for each selected type", async () => {
+	const queriedCategories = [];
 	await withMockedFetch(async (input) => {
 		const url = new URL(String(input));
 		assert.equal(url.hostname, "api.geoapify.com");
 		assert.equal(url.pathname, "/v2/places");
 		assert.equal(url.searchParams.get("apiKey"), "test-api-key");
-		assert.equal(url.searchParams.get("filter"), "circle:-1.0803,53.9583,5000");
+		assert.equal(url.searchParams.get("filter"), "circle:-1.0803,53.9583,2000");
 		assert.equal(url.searchParams.get("bias"), "proximity:-1.0803,53.9583");
 		assert.equal(url.searchParams.get("limit"), "100");
 		assert.equal(url.searchParams.get("groupSize"), null);
 		const categories = url.searchParams.get("categories").split(",");
-		assert.ok(categories.includes("catering.restaurant"));
-		assert.ok(!categories.includes("catering.cafe"));
-		assert.ok(!categories.includes("catering.food_court"));
-		assert.ok(categories.includes("adult.nightclub"));
-		assert.ok(categories.includes("entertainment.escape_game"));
+		queriedCategories.push(categories);
+		if (!categories.includes("catering.restaurant")) return Response.json({ features: [] });
 		return Response.json({ features: [
 			{ properties: {
 				place_id: "sample-venue",
@@ -152,12 +236,28 @@ test("venue search requests nearby Geoapify categories and normalizes venue deta
 		] });
 	}, async () => {
 		const response = await app.request(
-			"/api/venues?lat=53.9583&lon=-1.0803&types=food,drinks,activities&groupSize=20",
+			"/api/venues?lat=53.9583&lon=-1.0803&types=food,drinks,activities&groupSize=20&radiusKm=2",
 			{},
 			bindings,
 		);
 		assert.equal(response.status, 200);
-		const venue = (await response.json()).elements[0];
+		const responseData = await response.json();
+		assert.deepEqual(Object.keys(responseData.results).sort(), ["activities", "drinks", "food"]);
+		const venue = responseData.results.food[0];
+		assert.equal(queriedCategories.length, 3);
+		assert.deepEqual(queriedCategories.sort((first, second) => first.length - second.length), [
+			["catering.restaurant"],
+			["catering.bar", "catering.biergarten", "catering.pub", "adult.nightclub"],
+			[
+				"entertainment.activity_park",
+				"entertainment.amusement_arcade",
+				"entertainment.bowling_alley",
+				"entertainment.cinema",
+				"entertainment.culture.theatre",
+				"entertainment.escape_game",
+				"entertainment.miniature_golf",
+			],
+		].sort((first, second) => first.length - second.length));
 		assert.equal(venue.id, "sample-venue");
 		assert.equal(venue.tags.name, "Sample Venue");
 		assert.equal(venue.tags.capacity, "32");
@@ -169,15 +269,57 @@ test("venue search requests nearby Geoapify categories and normalizes venue deta
 	});
 });
 
+test("venue results remain in their independently selected category lists", async () => {
+	await withMockedFetch(async (input) => {
+		const categories = new URL(String(input)).searchParams.get("categories").split(",");
+		if (categories.includes("catering.restaurant")) {
+			return Response.json({ features: [{ properties: {
+				place_id: "food-place",
+				name: "Dinner House",
+				categories: ["catering.restaurant"],
+				lat: 53.96,
+				lon: -1.08,
+			} }] });
+		}
+		if (categories.includes("catering.pub")) {
+			return Response.json({ features: [{ properties: {
+				place_id: "drinks-place",
+				name: "York Pub",
+				categories: ["catering.pub"],
+				lat: 53.96,
+				lon: -1.08,
+			} }] });
+		}
+		return Response.json({ features: [{ properties: {
+			place_id: "activity-place",
+			name: "Escape Venue",
+			categories: ["entertainment.escape_game"],
+			lat: 53.96,
+			lon: -1.08,
+		} }] });
+	}, async () => {
+		const response = await app.request(
+			"/api/venues?lat=53.95&lon=-1.08&types=food,drinks,activities&groupSize=10&radiusKm=5",
+			{},
+			bindings,
+		);
+		assert.equal(response.status, 200);
+		const { results } = await response.json();
+		assert.deepEqual(results.food.map((venue) => venue.tags.name), ["Dinner House"]);
+		assert.deepEqual(results.drinks.map((venue) => venue.tags.name), ["York Pub"]);
+		assert.deepEqual(results.activities.map((venue) => venue.tags.name), ["Escape Venue"]);
+	});
+});
+
 test("single-category venue searches only request relevant provider categories and allow empty results", async () => {
 	await withMockedFetch(async (input) => {
 		const url = new URL(String(input));
 		assert.equal(url.searchParams.get("categories"), "catering.restaurant");
 		return Response.json({ features: [] });
 	}, async () => {
-		const response = await app.request("/api/venues?lat=53.9&lon=-1.1&types=food&groupSize=10", {}, bindings);
+		const response = await app.request("/api/venues?lat=53.9&lon=-1.1&types=food&groupSize=10&radiusKm=5", {}, bindings);
 		assert.equal(response.status, 200);
-		assert.deepEqual((await response.json()).elements, []);
+		assert.deepEqual((await response.json()).results, { activities: [], food: [], drinks: [] });
 	});
 });
 
@@ -195,18 +337,19 @@ test("venue search filters cafés, fast food, and known-too-small listings while
 		{ properties: { name: "Escape Game with Cafe", categories: ["entertainment.escape_game", "catering.cafe"], lat: 53.96, lon: -1.08, distance: 800 } },
 	] }), async () => {
 		const response = await app.request(
-			"/api/venues?lat=53.95&lon=-1.08&types=activities,food,drinks&groupSize=20",
+			"/api/venues?lat=53.95&lon=-1.08&types=activities,food,drinks&groupSize=20&radiusKm=5",
 			{},
 			bindings,
 		);
 		assert.equal(response.status, 200);
-		const venues = (await response.json()).elements;
-		assert.deepEqual(venues.map((venue) => venue.tags.name), [
+		const results = (await response.json()).results;
+		assert.deepEqual(results.food.map((venue) => venue.tags.name), [
 			"Suitable Restaurant",
 			"Exactly Enough Restaurant",
 			"Restaurant, Pub and Cafe",
-			"Escape Game with Cafe",
 		]);
+		assert.deepEqual(results.drinks.map((venue) => venue.tags.name), ["Restaurant, Pub and Cafe"]);
+		assert.deepEqual(results.activities.map((venue) => venue.tags.name), ["Escape Game with Cafe"]);
 	});
 });
 
@@ -239,9 +382,9 @@ test("venue search filters unsuitable candidates before sorting and limiting the
 		];
 		return Response.json({ features });
 	}, async () => {
-		const response = await app.request("/api/venues?lat=53.95&lon=-1.08&types=food&groupSize=10", {}, bindings);
+		const response = await app.request("/api/venues?lat=53.95&lon=-1.08&types=food&groupSize=10&radiusKm=5", {}, bindings);
 		assert.equal(response.status, 200);
-		const venues = (await response.json()).elements;
+		const venues = (await response.json()).results.food;
 		assert.equal(venues.length, 20);
 		assert.deepEqual(venues.slice(0, 2).map((venue) => venue.tags.name), ["Suitable 0", "Suitable 1"]);
 		assert.ok(venues.every((venue) => venue.tags.name.startsWith("Suitable ")));
@@ -256,9 +399,9 @@ test("venue search calculates a distance when the provider omits it", async () =
 		lat: 53.96,
 		lon: -1.08,
 	} }] }), async () => {
-		const response = await app.request("/api/venues?lat=53.9583&lon=-1.0803&types=food&groupSize=10", {}, bindings);
+		const response = await app.request("/api/venues?lat=53.9583&lon=-1.0803&types=food&groupSize=10&radiusKm=5", {}, bindings);
 		assert.equal(response.status, 200);
-		const venue = (await response.json()).elements[0];
+		const venue = (await response.json()).results.food[0];
 		assert.equal(venue.tags.name, "Nearby Venue");
 		assert.ok(venue.distance > 0);
 		assert.ok(venue.distance < 5000);
@@ -267,14 +410,127 @@ test("venue search calculates a distance when the provider omits it", async () =
 
 test("venue search reports provider outages and malformed results instead of empty results", async () => {
 	await withMockedFetch(async () => new Response("busy", { status: 429 }), async () => {
-		const response = await app.request("/api/venues?lat=0&lon=0&types=food&groupSize=10", {}, bindings);
+		const response = await app.request("/api/venues?lat=0&lon=0&types=food&groupSize=10&radiusKm=5", {}, bindings);
 		assert.equal(response.status, 502);
 		assert.match((await response.json()).error, /temporarily unavailable/i);
 	});
 
 	await withMockedFetch(async () => Response.json({ elements: [] }), async () => {
-		const response = await app.request("/api/venues?lat=0&lon=0&types=food&groupSize=10", {}, bindings);
+		const response = await app.request("/api/venues?lat=0&lon=0&types=food&groupSize=10&radiusKm=5", {}, bindings);
 		assert.equal(response.status, 502);
 		assert.match((await response.json()).error, /invalid response/i);
 	});
+});
+
+test("shared-search creation validates snapshots and requires D1", async () => {
+	const noDatabase = await app.request("/api/searches", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(testSnapshot),
+	}, {});
+	assert.equal(noDatabase.status, 503);
+
+	const database = new MemoryD1();
+	for (const snapshot of [
+		{ ...testSnapshot, radiusKm: 3 },
+		{ ...testSnapshot, groupSize: 0 },
+		{ ...testSnapshot, location: { ...testSnapshot.location, lat: 100 } },
+		{ ...testSnapshot, location: { ...testSnapshot.location, lat: null } },
+		{ ...testSnapshot, types: [] },
+		{ ...testSnapshot, results: { ...testSnapshot.results, food: [{ id: "invalid", tags: { name: "" } }] } },
+		{ ...testSnapshot, results: { ...testSnapshot.results, food: [{ ...testSnapshot.results.food[0], tags: { name: "Venue", website: {} } }] } },
+	]) {
+		const response = await app.request("/api/searches", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(snapshot),
+		}, { DB: database });
+		assert.equal(response.status, 400);
+	}
+});
+
+test("shared shortlist and votes persist, remain idempotent, and cannot target unknown venues", async () => {
+	const database = new MemoryD1();
+	const create = await app.request("/api/searches", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(testSnapshot),
+	}, { DB: database });
+	assert.equal(create.status, 201);
+	const { id } = await create.json();
+	assert.match(id, /^[\da-f-]{36}$/i);
+
+	const voterId = "123e4567-e89b-42d3-a456-426614174000";
+	const unknownVenue = await app.request(`/api/searches/${id}/shortlist`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ venueId: "not-in-search", action: "add" }),
+	}, { DB: database });
+	assert.equal(unknownVenue.status, 404);
+
+	const voteBeforeShortlist = await app.request(`/api/searches/${id}/votes`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ venueId: "restaurant-1", voterId, voted: true }),
+	}, { DB: database });
+	assert.equal(voteBeforeShortlist.status, 409);
+
+	for (let index = 0; index < 2; index++) {
+		const add = await app.request(`/api/searches/${id}/shortlist`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ venueId: "restaurant-1", action: "add" }),
+		}, { DB: database });
+		assert.equal(add.status, 200);
+	}
+	for (let index = 0; index < 2; index++) {
+		const vote = await app.request(`/api/searches/${id}/votes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ venueId: "restaurant-1", voterId, voted: true }),
+		}, { DB: database });
+		assert.equal(vote.status, 200);
+	}
+
+	const shared = await app.request(`/api/searches/${id}?voterId=${voterId}`, {}, { DB: database });
+	assert.equal(shared.status, 200);
+	const sharedData = await shared.json();
+	assert.equal(sharedData.snapshot.location.label, "York, UK");
+	assert.deepEqual(sharedData.shortlist.map(({ venueId, votes, votedByMe }) => ({ venueId, votes, votedByMe })), [
+		{ venueId: "restaurant-1", votes: 1, votedByMe: true },
+	]);
+
+	const secondVoter = await app.request(`/api/searches/${id}?voterId=123e4567-e89b-42d3-a456-426614174001`, {}, { DB: database });
+	const secondVoterData = await secondVoter.json();
+	assert.equal(secondVoterData.shortlist[0].votes, 1);
+	assert.equal(secondVoterData.shortlist[0].votedByMe, false);
+
+	const removeVote = await app.request(`/api/searches/${id}/votes`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ venueId: "restaurant-1", voterId, voted: false }),
+	}, { DB: database });
+	assert.equal(removeVote.status, 200);
+
+	const removeFromShortlist = await app.request(`/api/searches/${id}/shortlist`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ venueId: "restaurant-1", action: "remove" }),
+	}, { DB: database });
+	assert.equal(removeFromShortlist.status, 200);
+	const emptyShortlist = await app.request(`/api/searches/${id}?voterId=${voterId}`, {}, { DB: database });
+	assert.deepEqual((await emptyShortlist.json()).shortlist, []);
+});
+
+test("shared-search routes report missing records and validate ids and votes", async () => {
+	const database = new MemoryD1();
+	assert.equal((await app.request("/api/searches/not-a-uuid", {}, { DB: database })).status, 400);
+	assert.equal((await app.request("/api/searches/123e4567-e89b-42d3-a456-426614174000", {}, { DB: database })).status, 404);
+
+	const invalidVote = await app.request("/api/searches/123e4567-e89b-42d3-a456-426614174000/votes", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ venueId: "restaurant-1", voterId: "not-a-uuid", voted: true }),
+	}, { DB: database });
+	assert.equal(invalidVote.status, 400);
 });

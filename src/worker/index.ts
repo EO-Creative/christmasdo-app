@@ -1,7 +1,14 @@
 import { Hono } from "hono";
 
-type WorkerBindings = { GEOAPIFY_API_KEY?: string };
+type WorkerBindings = { GEOAPIFY_API_KEY?: string; DB?: D1Database };
 type VenueType = "activities" | "food" | "drinks";
+type SearchSnapshot = {
+	location: { label: string; lat: number; lon: number };
+	groupSize: number;
+	radiusKm: number;
+	types: VenueType[];
+	results: Record<VenueType, NormalizedVenue[]>;
+};
 
 const app = new Hono<{ Bindings: WorkerBindings }>();
 const venueTypes: VenueType[] = ["activities", "food", "drinks"];
@@ -87,6 +94,9 @@ function venueResult(value: unknown, requestedCategories: string[], latitude: nu
 	const categories = Array.isArray(place.categories)
 		? place.categories.filter((category): category is string => typeof category === "string")
 		: [];
+	if (!categories.some((candidate) => requestedCategories.some((requested) =>
+		candidate === requested || candidate.startsWith(`${requested}.`),
+	))) return undefined;
 	const category = categories.find((candidate) => requestedCategories.includes(candidate)) ??
 		categories.find((candidate) => requestedCategories.some((requested) => candidate.startsWith(`${requested}.`))) ??
 		categories[0] ?? "venue";
@@ -139,7 +149,8 @@ function isUnsuitableVenue(value: unknown, requestedCategories: string[], groupS
 		? place.categories.filter((category): category is string => typeof category === "string")
 		: [];
 	const hasSelectedAlternative = categories.some((category) =>
-		category !== "catering.restaurant" && requestedCategories.includes(category),
+		requestedCategories.some((requested) => requested !== "catering.restaurant" &&
+			(category === requested || category.startsWith(`${requested}.`))),
 	);
 	if (hasSelectedAlternative) return false;
 
@@ -158,6 +169,76 @@ function sortVenueCandidates(first: NormalizedVenue, second: NormalizedVenue): n
 	if (first.distance < second.distance) return -1;
 	if (first.distance > second.distance) return 1;
 	return (first.tags.name || "").localeCompare(second.tags.name || "");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isValidShareId(value: string): boolean {
+	return /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(value);
+}
+
+function isValidVenue(value: unknown): value is NormalizedVenue {
+	if (!isRecord(value) || typeof value.id !== "string" || value.id.length < 1 || value.id.length > 200) return false;
+	if (!isRecord(value.tags) || typeof value.tags.name !== "string" || !value.tags.name.trim() || value.tags.name.length > 200) return false;
+	if (value.type !== "node" || typeof value.lat !== "number" || typeof value.lon !== "number") return false;
+	if (value.distance !== undefined && (typeof value.distance !== "number" || !Number.isFinite(value.distance) || value.distance < 0)) return false;
+	if ([value.address, value.category].some((field) => field !== undefined && typeof field !== "string")) return false;
+	if (Object.values(value.tags).some((field) => field !== undefined && typeof field !== "string")) return false;
+	return Number.isFinite(value.lat) && value.lat >= -90 && value.lat <= 90 &&
+		Number.isFinite(value.lon) && value.lon >= -180 && value.lon <= 180;
+}
+
+function validateSnapshot(value: unknown): SearchSnapshot | undefined {
+	if (!isRecord(value) || !isRecord(value.location) || !isRecord(value.results)) return undefined;
+	const { location } = value;
+	if (typeof location.label !== "string" || !location.label.trim() || location.label.length > 200) return undefined;
+	if (typeof location.lat !== "number" || typeof location.lon !== "number") return undefined;
+	const latitude = location.lat;
+	const longitude = location.lon;
+	if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return undefined;
+	if (!Number.isSafeInteger(value.groupSize) || Number(value.groupSize) < 1 || Number(value.groupSize) > 10000) return undefined;
+	if (typeof value.radiusKm !== "number" || ![1, 2, 5, 10, 20].includes(value.radiusKm)) return undefined;
+	if (!Array.isArray(value.types) || value.types.length < 1 || value.types.length > venueTypes.length ||
+		value.types.some((type) => typeof type !== "string" || !venueTypes.includes(type as VenueType)) ||
+		new Set(value.types).size !== value.types.length) return undefined;
+
+	const types = value.types as VenueType[];
+	let venueCount = 0;
+	const results = {} as Record<VenueType, NormalizedVenue[]>;
+	for (const type of venueTypes) {
+		const venues = value.results[type];
+		if (!Array.isArray(venues) || venues.length > 20 || venues.some((venue) => !isValidVenue(venue))) return undefined;
+		venueCount += venues.length;
+		results[type] = venues as NormalizedVenue[];
+	}
+	if (venueCount > 60 || venueTypes.some((type) => !types.includes(type) && results[type].length > 0)) return undefined;
+
+	return {
+		location: { label: location.label.trim(), lat: latitude, lon: longitude },
+		groupSize: Number(value.groupSize),
+		radiusKm: value.radiusKm,
+		types,
+		results,
+	};
+}
+
+function snapshotHasVenue(snapshot: SearchSnapshot, venueId: string): boolean {
+	return venueTypes.some((type) => snapshot.results[type].some((venue) => venue.id === venueId));
+}
+
+async function readSearch(db: D1Database, id: string): Promise<{ snapshot: SearchSnapshot; createdAt: number } | undefined> {
+	const row = await db.prepare("SELECT search_json, created_at FROM searches WHERE id = ?")
+		.bind(id)
+		.first<{ search_json: string; created_at: number }>();
+	if (!row) return undefined;
+	try {
+		const snapshot = validateSnapshot(JSON.parse(row.search_json));
+		return snapshot ? { snapshot, createdAt: row.created_at } : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 app.get("/api/suggest", async (c) => {
@@ -220,6 +301,7 @@ app.get("/api/venues", async (c) => {
 	const lon = c.req.query("lon");
 	const typeParam = c.req.query("types");
 	const groupSizeParam = c.req.query("groupSize");
+	const radiusParam = c.req.query("radiusKm");
 
 	if (lat === undefined || lon === undefined) {
 		return c.json({ error: "A location is required before searching for venues." }, 400);
@@ -245,14 +327,19 @@ app.get("/api/venues", async (c) => {
 	if (types.length === 0 || types.some((type) => !venueTypes.includes(type as VenueType))) {
 		return c.json({ error: "One or more selected venue types are not supported." }, 400);
 	}
+	if (new Set(types).size !== types.length) return c.json({ error: "Each venue type can only be selected once." }, 400);
 	const groupSize = Number(groupSizeParam);
 	if (
 		groupSizeParam === undefined ||
 		groupSizeParam.trim() === "" ||
 		!Number.isSafeInteger(groupSize) ||
-		groupSize < 1
+		groupSize < 1 || groupSize > 10000
 	) {
-		return c.json({ error: "Enter a valid whole-number group size, starting at 1." }, 400);
+		return c.json({ error: "Enter a valid whole-number group size between 1 and 10,000." }, 400);
+	}
+	const radiusKm = Number(radiusParam);
+	if (radiusParam === undefined || ![1, 2, 5, 10, 20].includes(radiusKm)) {
+		return c.json({ error: "Choose a search radius of 1, 2, 5, 10, or 20 km." }, 400);
 	}
 
 	const apiKey = geoapifyKey(c.env);
@@ -260,40 +347,169 @@ app.get("/api/venues", async (c) => {
 		return c.json({ error: "Venue search is not configured. Add GEOAPIFY_API_KEY to the Worker settings." }, 503);
 	}
 
-	const categories = [...new Set(types.flatMap((type) => categoriesByType[type as VenueType]))];
+	const selectedCategories = types.flatMap((type) => categoriesByType[type as VenueType]);
 	try {
-		const params = new URLSearchParams({
-			apiKey,
-			categories: categories.join(","),
-			filter: `circle:${longitude},${latitude},5000`,
-			bias: `proximity:${longitude},${latitude}`,
-			limit: "100",
-			lang: "en",
-		});
-		const response = await fetch(`https://api.geoapify.com/v2/places?${params}`, {
-			signal: AbortSignal.timeout(10000),
-		});
-		if (!response.ok) {
-			return c.json({ error: "Venue search is temporarily unavailable. Please try again shortly." }, 502);
+		const categoryResults = await Promise.all(types.map(async (type) => {
+			const categories = categoriesByType[type as VenueType];
+			const params = new URLSearchParams({
+				apiKey,
+				categories: categories.join(","),
+				filter: `circle:${longitude},${latitude},${radiusKm * 1000}`,
+				bias: `proximity:${longitude},${latitude}`,
+				limit: "100",
+				lang: "en",
+			});
+			const response = await fetch(`https://api.geoapify.com/v2/places?${params}`, {
+				signal: AbortSignal.timeout(10000),
+			});
+			if (!response.ok) throw new Error("Venue provider unavailable");
+			const data: unknown = await response.json();
+			if (!isRecord(data) || !Array.isArray(data.features)) throw new Error("Venue search returned an invalid response.");
+			const elements = data.features
+				.map((feature) => {
+					const properties = isRecord(feature) ? feature.properties : undefined;
+					const venue = venueResult(properties, categories, latitude, longitude);
+					return venue && !isUnsuitableVenue(properties, selectedCategories, groupSize, venue.tags.capacity) ? venue : undefined;
+				})
+				.filter((venue): venue is NormalizedVenue => venue !== undefined)
+				.sort(sortVenueCandidates)
+				.slice(0, 20);
+			return [type, elements] as const;
+		}));
+		const results = Object.fromEntries(categoryResults) as Record<VenueType, NormalizedVenue[]>;
+		for (const type of venueTypes) results[type] ??= [];
+		return c.json({ results });
+	} catch (error) {
+		if (error instanceof Error && error.message === "Venue search returned an invalid response.") {
+			return c.json({ error: error.message }, 502);
 		}
-		const data: unknown = await response.json();
-		if (!data || typeof data !== "object" || !Array.isArray((data as { features?: unknown }).features)) {
-			return c.json({ error: "Venue search returned an invalid response." }, 502);
-		}
-		const elements = (data as { features: unknown[] }).features
-			.map((feature) => {
-				const properties = feature && typeof feature === "object"
-					? (feature as { properties?: unknown }).properties
-					: undefined;
-				const venue = venueResult(properties, categories, latitude, longitude);
-				return venue && !isUnsuitableVenue(properties, categories, groupSize, venue.tags.capacity) ? venue : undefined;
-			})
-			.filter((venue): venue is NormalizedVenue => venue !== undefined)
-			.sort(sortVenueCandidates)
-			.slice(0, 20);
-		return c.json({ elements });
-	} catch {
 		return c.json({ error: "Venue search is temporarily unavailable. Please try again shortly." }, 502);
+	}
+});
+
+app.post("/api/searches", async (c) => {
+	if (!c.env.DB) return c.json({ error: "Shared searches are not configured. Set up the Cloudflare D1 database." }, 503);
+	const contentLength = Number(c.req.header("content-length") || 0);
+	if (contentLength > 1_000_000) return c.json({ error: "Search snapshot is too large." }, 413);
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Search snapshot must be valid JSON." }, 400);
+	}
+	const snapshot = validateSnapshot(body);
+	if (!snapshot) return c.json({ error: "Search snapshot is invalid." }, 400);
+	if (JSON.stringify(snapshot).length > 1_000_000) return c.json({ error: "Search snapshot is too large." }, 413);
+
+	const id = crypto.randomUUID();
+	try {
+		await c.env.DB.prepare("INSERT INTO searches (id, created_at, search_json) VALUES (?, ?, ?)")
+			.bind(id, Date.now(), JSON.stringify(snapshot))
+			.run();
+		return c.json({ id }, 201);
+	} catch {
+		return c.json({ error: "Could not save this search. Please try again." }, 503);
+	}
+});
+
+app.get("/api/searches/:id", async (c) => {
+	if (!c.env.DB) return c.json({ error: "Shared searches are not configured. Set up the Cloudflare D1 database." }, 503);
+	const id = c.req.param("id");
+	if (!isValidShareId(id)) return c.json({ error: "This share link is invalid." }, 400);
+	const voterId = c.req.query("voterId");
+	if (voterId !== undefined && !isValidShareId(voterId)) return c.json({ error: "The voting identity is invalid." }, 400);
+
+	try {
+		const search = await readSearch(c.env.DB, id);
+		if (!search) return c.json({ error: "This shared search could not be found." }, 404);
+		const shortlist = await c.env.DB.prepare(`
+			SELECT s.venue_id, s.added_at, COUNT(v.voter_id) AS vote_count,
+				MAX(CASE WHEN v.voter_id = ? THEN 1 ELSE 0 END) AS voted_by_me
+			FROM shortlist AS s
+			LEFT JOIN votes AS v ON v.search_id = s.search_id AND v.venue_id = s.venue_id
+			WHERE s.search_id = ?
+			GROUP BY s.venue_id, s.added_at
+			ORDER BY vote_count DESC, s.added_at ASC
+		`).bind(voterId || "", id).all<{ venue_id: string; added_at: number; vote_count: number; voted_by_me: number }>();
+		c.header("Cache-Control", "no-store");
+		return c.json({
+			id,
+			createdAt: search.createdAt,
+			snapshot: search.snapshot,
+			shortlist: shortlist.results.map((entry) => ({
+				venueId: entry.venue_id,
+				addedAt: entry.added_at,
+				votes: entry.vote_count,
+				votedByMe: entry.voted_by_me === 1,
+			})),
+		});
+	} catch {
+		return c.json({ error: "Could not load this shared search. Please try again." }, 503);
+	}
+});
+
+app.post("/api/searches/:id/shortlist", async (c) => {
+	if (!c.env.DB) return c.json({ error: "Shared searches are not configured. Set up the Cloudflare D1 database." }, 503);
+	const id = c.req.param("id");
+	if (!isValidShareId(id)) return c.json({ error: "This share link is invalid." }, 400);
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Shortlist update must be valid JSON." }, 400);
+	}
+	if (!isRecord(body) || typeof body.venueId !== "string" || body.venueId.length < 1 || body.venueId.length > 200 ||
+		(body.action !== "add" && body.action !== "remove")) return c.json({ error: "Shortlist update is invalid." }, 400);
+
+	try {
+		const search = await readSearch(c.env.DB, id);
+		if (!search) return c.json({ error: "This shared search could not be found." }, 404);
+		if (!snapshotHasVenue(search.snapshot, body.venueId)) return c.json({ error: "That venue is not part of this search." }, 404);
+		if (body.action === "add") {
+			await c.env.DB.prepare("INSERT OR IGNORE INTO shortlist (search_id, venue_id, added_at) VALUES (?, ?, ?)")
+				.bind(id, body.venueId, Date.now()).run();
+		} else {
+			await c.env.DB.prepare("DELETE FROM shortlist WHERE search_id = ? AND venue_id = ?")
+				.bind(id, body.venueId).run();
+		}
+		return c.json({ ok: true });
+	} catch {
+		return c.json({ error: "Could not update the shortlist. Please try again." }, 503);
+	}
+});
+
+app.post("/api/searches/:id/votes", async (c) => {
+	if (!c.env.DB) return c.json({ error: "Shared searches are not configured. Set up the Cloudflare D1 database." }, 503);
+	const id = c.req.param("id");
+	if (!isValidShareId(id)) return c.json({ error: "This share link is invalid." }, 400);
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Vote update must be valid JSON." }, 400);
+	}
+	if (!isRecord(body) || typeof body.venueId !== "string" || body.venueId.length < 1 || body.venueId.length > 200 ||
+		typeof body.voterId !== "string" || !isValidShareId(body.voterId) || typeof body.voted !== "boolean") {
+		return c.json({ error: "Vote update is invalid." }, 400);
+	}
+
+	try {
+		const search = await readSearch(c.env.DB, id);
+		if (!search) return c.json({ error: "This shared search could not be found." }, 404);
+		if (!snapshotHasVenue(search.snapshot, body.venueId)) return c.json({ error: "That venue is not part of this search." }, 404);
+		const shortlistEntry = await c.env.DB.prepare("SELECT venue_id FROM shortlist WHERE search_id = ? AND venue_id = ?")
+			.bind(id, body.venueId).first();
+		if (!shortlistEntry) return c.json({ error: "Add the venue to the shortlist before voting." }, 409);
+		if (body.voted) {
+			await c.env.DB.prepare("INSERT OR IGNORE INTO votes (search_id, venue_id, voter_id, created_at) VALUES (?, ?, ?, ?)")
+				.bind(id, body.venueId, body.voterId, Date.now()).run();
+		} else {
+			await c.env.DB.prepare("DELETE FROM votes WHERE search_id = ? AND venue_id = ? AND voter_id = ?")
+				.bind(id, body.venueId, body.voterId).run();
+		}
+		return c.json({ ok: true });
+	} catch {
+		return c.json({ error: "Could not record your vote. Please try again." }, 503);
 	}
 });
 

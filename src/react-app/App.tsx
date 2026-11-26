@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { getCapacityStatus, sortVenuesBySuitability } from "./venue-utils";
 import "./App.css";
+
+type VenueType = "activities" | "food" | "drinks";
 
 interface Venue {
 	id: string;
@@ -36,8 +38,30 @@ interface LocationSearchResponse {
 	results?: GeocodingResult[];
 }
 
+interface SearchSnapshot {
+	location: { label: string; lat: number; lon: number };
+	groupSize: number;
+	radiusKm: number;
+	types: VenueType[];
+	results: Record<VenueType, Venue[]>;
+}
+
 interface VenueSearchResponse {
-	elements?: Venue[];
+	results?: Partial<Record<VenueType, Venue[]>>;
+}
+
+interface ShortlistItem {
+	venueId: string;
+	addedAt: number;
+	votes: number;
+	votedByMe: boolean;
+}
+
+interface SharedSearchResponse {
+	id: string;
+	createdAt: number;
+	snapshot: SearchSnapshot;
+	shortlist: ShortlistItem[];
 }
 
 interface ApiError {
@@ -49,6 +73,21 @@ const venueTypeLabels = {
 	food: "Food",
 	drinks: "Drinks",
 };
+const venueTypes: VenueType[] = ["activities", "food", "drinks"];
+const radiusOptions = [1, 2, 5, 10, 20];
+const voterStorageKey = "christmasdo-voter-id";
+
+function getVoterId(): string {
+	try {
+		const existing = window.localStorage.getItem(voterStorageKey);
+		if (existing && /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(existing)) return existing;
+		const created = window.crypto.randomUUID();
+		window.localStorage.setItem(voterStorageKey, created);
+		return created;
+	} catch {
+		return window.crypto.randomUUID();
+	}
+}
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 	const response = await fetch(url, init);
@@ -83,11 +122,56 @@ function App() {
 	const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1);
 	const [groupSize, setGroupSize] = useState("10");
 	const [searchedGroupSize, setSearchedGroupSize] = useState(10);
+	const [searchedLocation, setSearchedLocation] = useState("");
+	const [searchedRadiusKm, setSearchedRadiusKm] = useState(5);
+	const [searchedTypes, setSearchedTypes] = useState<VenueType[]>([]);
 	const [types, setTypes] = useState({ activities: false, food: false, drinks: false });
-	const [results, setResults] = useState<Venue[]>([]);
+	const [radiusKm, setRadiusKm] = useState(5);
+	const [results, setResults] = useState<Record<VenueType, Venue[]>>({ activities: [], food: [], drinks: [] });
+	const [shareId, setShareId] = useState("");
+	const [voterId, setVoterId] = useState("");
+	const [shortlist, setShortlist] = useState<ShortlistItem[]>([]);
+	const [refreshingShare, setRefreshingShare] = useState(false);
+	const [busyVenueId, setBusyVenueId] = useState("");
+	const [copied, setCopied] = useState(false);
 	const [loading, setLoading] = useState(false);
 	const [hasSearched, setHasSearched] = useState(false);
 	const [error, setError] = useState("");
+	const [shareError, setShareError] = useState("");
+
+	const applySharedSearch = useCallback((shared: SharedSearchResponse) => {
+		const snapshot = shared.snapshot;
+		setShareId(shared.id);
+		setLocation(snapshot.location.label);
+		setSelectedLocation({
+			id: snapshot.location.label,
+			label: snapshot.location.label,
+			lat: snapshot.location.lat,
+			lon: snapshot.location.lon,
+		});
+		setGroupSize(String(snapshot.groupSize));
+		setSearchedGroupSize(snapshot.groupSize);
+		setSearchedLocation(snapshot.location.label);
+		setSearchedRadiusKm(snapshot.radiusKm);
+		setSearchedTypes(snapshot.types);
+		setRadiusKm(snapshot.radiusKm);
+		setTypes({
+			activities: snapshot.types.includes("activities"),
+			food: snapshot.types.includes("food"),
+			drinks: snapshot.types.includes("drinks"),
+		});
+		setResults(snapshot.results);
+		setShortlist(shared.shortlist);
+		setHasSearched(true);
+	}, []);
+
+	const loadSharedSearch = useCallback(async (id: string, browserVoterId: string, applySnapshot = true) => {
+		const shared = await requestJson<SharedSearchResponse>(
+			`/api/searches/${encodeURIComponent(id)}?voterId=${encodeURIComponent(browserVoterId)}`,
+		);
+		if (applySnapshot) applySharedSearch(shared);
+		else setShortlist(shared.shortlist);
+	}, [applySharedSearch]);
 
 	useEffect(() => {
 		const query = location.trim();
@@ -128,6 +212,38 @@ function App() {
 		};
 	}, [location, selectedLocation]);
 
+	useEffect(() => {
+		const browserVoterId = getVoterId();
+		setVoterId(browserVoterId);
+		const sharedId = new URLSearchParams(window.location.search).get("share");
+		if (!sharedId) return;
+
+		setLoading(true);
+		loadSharedSearch(sharedId, browserVoterId).catch((caughtError) => {
+			setError(caughtError instanceof Error ? caughtError.message : "Could not open this shared search.");
+		}).finally(() => setLoading(false));
+	}, [loadSharedSearch]);
+
+	useEffect(() => {
+		if (!shareId || !voterId) return;
+		let active = true;
+		const refresh = async () => {
+			try {
+				const shared = await requestJson<SharedSearchResponse>(
+					`/api/searches/${encodeURIComponent(shareId)}?voterId=${encodeURIComponent(voterId)}`,
+				);
+				if (active) setShortlist(shared.shortlist);
+			} catch {
+				if (active) setShareError("Could not refresh shared votes; try again shortly.");
+			}
+		};
+		const timer = window.setInterval(refresh, 30000);
+		return () => {
+			active = false;
+			window.clearInterval(timer);
+		};
+	}, [shareId, voterId]);
+
 	const handleTypeChange = (type: keyof typeof types) => {
 		setTypes((prev) => ({ ...prev, [type]: !prev[type] }));
 	};
@@ -162,13 +278,17 @@ function App() {
 	const searchVenues = async (event: React.FormEvent<HTMLFormElement>) => {
 		event.preventDefault();
 		setError("");
-		setResults([]);
+		setShareError("");
+		setShareId("");
+		setShortlist([]);
+		setResults({ activities: [], food: [], drinks: [] });
 		setHasSearched(true);
 		setSuggestionsOpen(false);
+		window.history.replaceState(null, "", window.location.pathname);
 
 		const requestedGroupSize = Number(groupSize);
-		if (!Number.isSafeInteger(requestedGroupSize) || requestedGroupSize < 1) {
-			setError("Enter a whole number of people, starting at 1.");
+		if (!Number.isSafeInteger(requestedGroupSize) || requestedGroupSize < 1 || requestedGroupSize > 10000) {
+			setError("Enter a whole number of people between 1 and 10,000.");
 			return;
 		}
 
@@ -203,16 +323,46 @@ function App() {
 				lon: String(lon),
 				types: selectedTypes.join(","),
 				groupSize: String(requestedGroupSize),
+				radiusKm: String(radiusKm),
 			});
 			const venueData = await requestJson<VenueSearchResponse>(`/api/venues?${params}`);
-			const venues = Array.isArray(venueData.elements)
-				? venueData.elements.filter((venue) =>
-						venue.tags?.name &&
-						Number.isFinite(venue.lat ?? venue.center?.lat) &&
-						Number.isFinite(venue.lon ?? venue.center?.lon),
-					)
-				: [];
-			setResults(sortVenuesBySuitability(venues, requestedGroupSize));
+			const groupedResults = Object.fromEntries(venueTypes.map((type) => {
+				const venues = Array.isArray(venueData.results?.[type])
+					? venueData.results[type]!.filter((venue) =>
+							venue.tags?.name &&
+							Number.isFinite(venue.lat ?? venue.center?.lat) &&
+							Number.isFinite(venue.lon ?? venue.center?.lon),
+						)
+					: [];
+			return [type, sortVenuesBySuitability(venues, requestedGroupSize)];
+			})) as Record<VenueType, Venue[]>;
+			setResults(groupedResults);
+			setLocation(place.label);
+			setSelectedLocation(place);
+			const snapshot: SearchSnapshot = {
+				location: { label: place.label, lat, lon },
+				groupSize: requestedGroupSize,
+				radiusKm,
+				types: selectedTypes,
+				results: groupedResults,
+			};
+			setSearchedLocation(snapshot.location.label);
+			setSearchedRadiusKm(snapshot.radiusKm);
+			setSearchedTypes(snapshot.types);
+			try {
+				const saved = await requestJson<{ id: string }>("/api/searches", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify(snapshot),
+				});
+				setShareId(saved.id);
+				setShortlist([]);
+				const url = new URL(window.location.href);
+				url.searchParams.set("share", saved.id);
+				window.history.replaceState(null, "", url);
+			} catch (caughtError) {
+				setShareError(caughtError instanceof Error ? caughtError.message : "Search results could not be saved for sharing.");
+			}
 		} catch (caughtError) {
 			setError(caughtError instanceof Error ? caughtError.message : "Search failed. Please try again.");
 		} finally {
@@ -220,9 +370,137 @@ function App() {
 		}
 	};
 
-	const selectedLabels = Object.entries(types)
-		.filter(([, enabled]) => enabled)
-		.map(([type]) => venueTypeLabels[type as keyof typeof venueTypeLabels]);
+	const selectedLabels = searchedTypes.map((type) => venueTypeLabels[type]);
+	const allResults = venueTypes.flatMap((type) => results[type]);
+	const shortlistedVenues = shortlist.map((item) => ({
+		item,
+		venue: allResults.find((candidate) => candidate.id === item.venueId),
+	})).filter((entry): entry is { item: ShortlistItem; venue: Venue } => Boolean(entry.venue));
+	const shareUrl = shareId ? new URL(`?share=${encodeURIComponent(shareId)}`, window.location.href).href : "";
+
+	const refreshVotes = async () => {
+		if (!shareId || !voterId) return;
+		setRefreshingShare(true);
+		setShareError("");
+		try {
+			await loadSharedSearch(shareId, voterId, false);
+		} catch (caughtError) {
+			setShareError(caughtError instanceof Error ? caughtError.message : "Could not refresh the shared shortlist.");
+		} finally {
+			setRefreshingShare(false);
+		}
+	};
+
+	const updateShortlist = async (venueId: string, action: "add" | "remove") => {
+		if (!shareId) return;
+		setBusyVenueId(venueId);
+		setShareError("");
+		try {
+			await requestJson(`/api/searches/${encodeURIComponent(shareId)}/shortlist`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ venueId, action }),
+			});
+			await loadSharedSearch(shareId, voterId, false);
+		} catch (caughtError) {
+			setShareError(caughtError instanceof Error ? caughtError.message : "Could not update the shared shortlist.");
+		} finally {
+			setBusyVenueId("");
+		}
+	};
+
+	const toggleVote = async (venueId: string, voted: boolean) => {
+		if (!shareId || !voterId) return;
+		setBusyVenueId(venueId);
+		setShareError("");
+		try {
+			await requestJson(`/api/searches/${encodeURIComponent(shareId)}/votes`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ venueId, voterId, voted: !voted }),
+			});
+			await loadSharedSearch(shareId, voterId, false);
+		} catch (caughtError) {
+			setShareError(caughtError instanceof Error ? caughtError.message : "Could not record your vote.");
+		} finally {
+			setBusyVenueId("");
+		}
+	};
+
+	const copyShareLink = async () => {
+		try {
+			await navigator.clipboard.writeText(shareUrl);
+			setCopied(true);
+			window.setTimeout(() => setCopied(false), 1800);
+		} catch {
+			setShareError("Could not copy the link. Select and copy the share URL instead.");
+		}
+	};
+
+	const renderVenueCard = (venue: Venue, categoryType: VenueType, shortlistItem?: ShortlistItem) => {
+		const lat = venue.lat ?? venue.center?.lat;
+		const lon = venue.lon ?? venue.center?.lon;
+		const capacityStatus = getCapacityStatus(venue.tags.capacity, searchedGroupSize);
+		const category = (venue.category || venue.tags.amenity || venue.tags.leisure || "venue")
+			.replace(/_/g, " ")
+			.replace(/^\w/, (letter) => letter.toUpperCase());
+		const address = venue.address || [
+			[venue.tags["addr:housenumber"], venue.tags["addr:street"]].filter(Boolean).join(" "),
+			venue.tags["addr:city"],
+			venue.tags["addr:postcode"],
+		].filter(Boolean).join(", ");
+		const distance = typeof venue.distance === "number" ? `${(venue.distance / 1000).toFixed(1)} km away` : "";
+		const website = venue.tags.website ? safeWebsiteUrl(venue.tags.website) : undefined;
+		const phoneLink = venue.tags.phone?.replace(/[^\d+]/g, "");
+		const mapUrl = `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=17/${lat}/${lon}`;
+		const isShortlisted = Boolean(shortlistItem);
+
+		return (
+			<article className="venue-card" key={`${categoryType}-${venue.id}`}>
+				<div className="venue-card-topline">
+					<span className="category-pill">{category}</span>
+					<span className={`capacity-status ${capacityStatus}`}>
+						{capacityStatus === "fits" ? "Capacity listed" : capacityStatus === "too-small" ? "May be too small" : "Capacity unknown"}
+					</span>
+				</div>
+				<h3>{venue.tags.name}</h3>
+				{address && <p className="venue-address">{address}</p>}
+				{distance && <p className="venue-distance">{distance}</p>}
+				<p className={`capacity-detail ${capacityStatus}`}>
+					{capacityStatus === "fits" && `Listed capacity: ${venue.tags.capacity} people`}
+					{capacityStatus === "too-small" && `Listed for ${venue.tags.capacity} people; your group is ${searchedGroupSize}`}
+					{capacityStatus === "unknown" && "No numeric capacity listed for this venue."}
+				</p>
+				<div className="venue-links">
+					<a href={mapUrl} target="_blank" rel="noreferrer">View map <span aria-hidden="true">↗</span></a>
+					{website && <a href={website} target="_blank" rel="noreferrer">Website <span aria-hidden="true">↗</span></a>}
+					{phoneLink && <a href={`tel:${phoneLink}`}>Call venue</a>}
+				</div>
+				{shareId && (
+					<div className="venue-actions">
+						<button
+							type="button"
+							className="shortlist-button"
+							disabled={busyVenueId === venue.id}
+							onClick={() => updateShortlist(venue.id, isShortlisted ? "remove" : "add")}
+						>
+							{busyVenueId === venue.id ? "Saving…" : isShortlisted ? "Remove from shortlist" : "Add to shortlist"}
+						</button>
+						{shortlistItem && (
+							<button
+								type="button"
+								className={shortlistItem.votedByMe ? "vote-button voted" : "vote-button"}
+								disabled={busyVenueId === venue.id}
+								onClick={() => toggleVote(venue.id, shortlistItem.votedByMe)}
+							>
+								{shortlistItem.votedByMe ? "Your vote · " : "Vote · "}{shortlistItem.votes}
+							</button>
+						)}
+					</div>
+				)}
+			</article>
+		);
+	};
 
 	return (
 		<div className="container">
@@ -305,12 +583,19 @@ function App() {
 										value={groupSize}
 										onChange={(event) => setGroupSize(event.target.value)}
 										min="1"
+										max="10000"
 										step="1"
 										inputMode="numeric"
 										required
 									/>
 									<span>people</span>
 								</div>
+							</div>
+							<div className="form-group radius-field">
+								<label htmlFor="radiusKm">Search radius</label>
+								<select id="radiusKm" value={radiusKm} onChange={(event) => setRadiusKm(Number(event.target.value))}>
+									{radiusOptions.map((radius) => <option value={radius} key={radius}>{radius} km</option>)}
+								</select>
 							</div>
 						</div>
 
@@ -344,74 +629,80 @@ function App() {
 
 				<section className="results" aria-label="Venue search results" aria-live="polite">
 					{loading && <p className="loading-message">Looking for places around {location.trim()}…</p>}
-					{!loading && hasSearched && !error && results.length === 0 && (
+					{!hasSearched && <p className="results-prompt">Venue suggestions appear here in separate lists for each category, ordered by capacity suitability and distance.</p>}
+					{!loading && hasSearched && !error && allResults.length === 0 && (
 						<div className="empty-state">
-							<h2 id="results-title">No named venues found nearby</h2>
-							<p>Try a nearby town or city, or choose different venue types.</p>
+							<h2>No named venues found nearby</h2>
+							<p>Try a larger search radius, a nearby town or city, or different venue types.</p>
 						</div>
 					)}
-					{results.length > 0 && (
+					{!loading && shareError && <p className="error share-error" role="alert">{shareError}</p>}
+					{hasSearched && !loading && (allResults.length > 0 || shareId !== "") && (
 						<>
 							<div className="results-heading">
 								<div>
-									<p className="step-label">Your shortlist</p>
-									<h2 id="results-title">{results.length} potential {results.length === 1 ? "venue" : "venues"}</h2>
+									<p className="step-label">Venue options</p>
+									<h2 id="results-title">Results by category</h2>
 								</div>
-								<p className="results-context">Near {location.trim()}</p>
+								<p className="results-context">Near {searchedLocation} · within {searchedRadiusKm} km</p>
 							</div>
 							<p className="results-disclaimer">
-								Search includes {selectedLabels.join(" + ")}. Results can match any selected type, not every type.
-								Known capacities below {searchedGroupSize} are omitted. Café and fast-food listings are filtered unless they also match a selected activity or drinks category.
-								Capacity and listing details may be incomplete or out of date; confirm group bookings with the venue.
+								Showing separate lists for {selectedLabels.join(", ")}. Geoapify does not provide dependable customer ratings for these listings, so venues are ordered by listed capacity suitability and distance.
+								Known capacities below {searchedGroupSize} are omitted. Details may be incomplete; confirm group bookings directly.
 							</p>
-							<div className="venue-list">
-								{results.map((venue) => {
-									const lat = venue.lat ?? venue.center?.lat;
-									const lon = venue.lon ?? venue.center?.lon;
-								const capacityStatus = getCapacityStatus(venue.tags.capacity, searchedGroupSize);
-									const category = (venue.category || venue.tags.amenity || venue.tags.leisure || "venue")
-										.replace(/_/g, " ")
-										.replace(/^\w/, (letter) => letter.toUpperCase());
-									const address = venue.address || [
-										[venue.tags["addr:housenumber"], venue.tags["addr:street"]].filter(Boolean).join(" "),
-										venue.tags["addr:city"],
-										venue.tags["addr:postcode"],
-									].filter(Boolean).join(", ");
-									const distance = typeof venue.distance === "number" ? `${(venue.distance / 1000).toFixed(1)} km away` : "";
-									const website = venue.tags.website ? safeWebsiteUrl(venue.tags.website) : undefined;
-									const phoneLink = venue.tags.phone?.replace(/[^\d+]/g, "");
-									const mapUrl = `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=17/${lat}/${lon}`;
-
-									return (
-										<article className="venue-card" key={`${venue.type}-${venue.id}`}>
-											<div className="venue-card-topline">
-												<span className="category-pill">{category}</span>
-												<span className={`capacity-status ${capacityStatus}`}>
-													{capacityStatus === "fits" ? "Capacity listed" : capacityStatus === "too-small" ? "May be too small" : "Capacity unknown"}
-												</span>
-											</div>
-											<h3>{venue.tags.name}</h3>
-											{address && <p className="venue-address">{address}</p>}
-											{distance && <p className="venue-distance">{distance}</p>}
-											<p className={`capacity-detail ${capacityStatus}`}>
-												{capacityStatus === "fits" && `Listed capacity: ${venue.tags.capacity} people`}
-												{capacityStatus === "too-small" &&
-													`Listed for ${venue.tags.capacity} people; your group is ${searchedGroupSize}`}
-												{capacityStatus === "unknown" && "No numeric capacity listed for this venue."}
-											</p>
-											<div className="venue-links">
-												<a href={mapUrl} target="_blank" rel="noreferrer">View map <span aria-hidden="true">↗</span></a>
-												{website && <a href={website} target="_blank" rel="noreferrer">Website <span aria-hidden="true">↗</span></a>}
-												{phoneLink && <a href={`tel:${phoneLink}`}>Call venue</a>}
-											</div>
-										</article>
-									);
-								})}
-							</div>
+							{shareId && (
+								<div className="share-panel">
+									<div>
+										<h3>Share and decide together</h3>
+										<p>Anyone with this link can add venues to the shortlist and vote. Votes are anonymous and stored per browser.</p>
+									</div>
+									<div className="share-link-row">
+										<input aria-label="Shareable search link" readOnly value={shareUrl} onFocus={(event) => event.currentTarget.select()} />
+										<button type="button" className="share-button" onClick={copyShareLink}>{copied ? "Copied" : "Copy link"}</button>
+										<button type="button" className="refresh-button" onClick={refreshVotes} disabled={refreshingShare}>
+											{refreshingShare ? "Refreshing…" : "Refresh votes"}
+										</button>
+									</div>
+									<p className="share-note">A share link allows anyone who has it to edit the shortlist. Browser-based votes are not identity verified.</p>
+								</div>
+							)}
+							{!shareId && shareError && <p className="share-warning" role="status">Results are shown, but sharing is currently unavailable.</p>}
+							{searchedTypes.map((type) => (
+								<section className="category-results" key={type} aria-labelledby={`${type}-heading`}>
+									<div className="category-heading">
+										<h3 id={`${type}-heading`}>{venueTypeLabels[type]}</h3>
+										<span>{results[type].length} {results[type].length === 1 ? "venue" : "venues"}</span>
+									</div>
+									{results[type].length ? (
+										<div className="venue-list">
+											{results[type].map((venue) => renderVenueCard(
+												venue,
+												type,
+												shortlist.find((item) => item.venueId === venue.id),
+											))}
+										</div>
+									) : <p className="category-empty">No matches in this category within {searchedRadiusKm} km.</p>}
+								</section>
+							))}
+							<section className="shortlist-section" aria-labelledby="shortlist-heading">
+								<div className="category-heading">
+									<div>
+										<p className="step-label">Group decision</p>
+										<h3 id="shortlist-heading">Shortlist and votes</h3>
+									</div>
+									<span>{shortlistedVenues.length} selected</span>
+								</div>
+								{shortlistedVenues.length ? (
+									<div className="venue-list">
+										{shortlistedVenues.map(({ item, venue }) => renderVenueCard(
+											venue,
+											venueTypes.find((type) => results[type].some((candidate) => candidate.id === venue.id)) || "food",
+											item,
+										))}
+									</div>
+								) : <p className="category-empty">Add venues from the lists above to compare them and vote.</p>}
+							</section>
 						</>
-					)}
-					{!hasSearched && (
-						<p className="results-prompt">Your matching venues will appear here, filtered for your group size and ordered by capacity suitability and distance.</p>
 					)}
 				</section>
 			</main>
