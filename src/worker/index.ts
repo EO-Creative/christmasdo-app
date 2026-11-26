@@ -422,26 +422,51 @@ app.get("/api/searches/:id", async (c) => {
 	try {
 		const search = await readSearch(c.env.DB, id);
 		if (!search) return c.json({ error: "This shared search could not be found." }, 404);
-		const shortlist = await c.env.DB.prepare(`
-			SELECT s.venue_id, s.added_at, COUNT(v.voter_id) AS vote_count,
-				MAX(CASE WHEN v.voter_id = ? THEN 1 ELSE 0 END) AS voted_by_me
+		const shortlistRows = await c.env.DB.prepare(`
+			SELECT s.venue_id, s.added_at, v.category, v.voter_id
 			FROM shortlist AS s
-			LEFT JOIN votes AS v ON v.search_id = s.search_id AND v.venue_id = s.venue_id
+			LEFT JOIN category_votes AS v ON v.search_id = s.search_id AND v.venue_id = s.venue_id
 			WHERE s.search_id = ?
-			GROUP BY s.venue_id, s.added_at
-			ORDER BY vote_count DESC, s.added_at ASC
-		`).bind(voterId || "", id).all<{ venue_id: string; added_at: number; vote_count: number; voted_by_me: number }>();
+			ORDER BY s.added_at ASC
+		`).bind(id).all<{
+			venue_id: string;
+			added_at: number;
+			category: string | null;
+			voter_id: string | null;
+		}>();
+		const shortlistByVenue = new Map<string, {
+			venueId: string;
+			addedAt: number;
+			votes: Record<VenueType, number>;
+			votedByMe: VenueType[];
+		}>();
+		for (const row of shortlistRows.results) {
+			let entry = shortlistByVenue.get(row.venue_id);
+			if (!entry) {
+				entry = {
+					venueId: row.venue_id,
+					addedAt: row.added_at,
+					votes: { activities: 0, food: 0, drinks: 0 },
+					votedByMe: [],
+				};
+				shortlistByVenue.set(row.venue_id, entry);
+			}
+			if (row.category && venueTypes.includes(row.category as VenueType)) {
+				const category = row.category as VenueType;
+				entry.votes[category]++;
+				if (row.voter_id === voterId && !entry.votedByMe.includes(category)) entry.votedByMe.push(category);
+			}
+		}
+		const shortlist = [...shortlistByVenue.values()].sort((first, second) =>
+			Object.values(second.votes).reduce((total, count) => total + count, 0) -
+			Object.values(first.votes).reduce((total, count) => total + count, 0) || first.addedAt - second.addedAt,
+		);
 		c.header("Cache-Control", "no-store");
 		return c.json({
 			id,
 			createdAt: search.createdAt,
 			snapshot: search.snapshot,
-			shortlist: shortlist.results.map((entry) => ({
-				venueId: entry.venue_id,
-				addedAt: entry.added_at,
-				votes: entry.vote_count,
-				votedByMe: entry.voted_by_me === 1,
-			})),
+			shortlist,
 		});
 	} catch {
 		return c.json({ error: "Could not load this shared search. Please try again." }, 503);
@@ -489,6 +514,7 @@ app.post("/api/searches/:id/votes", async (c) => {
 		return c.json({ error: "Vote update must be valid JSON." }, 400);
 	}
 	if (!isRecord(body) || typeof body.venueId !== "string" || body.venueId.length < 1 || body.venueId.length > 200 ||
+		typeof body.category !== "string" || !venueTypes.includes(body.category as VenueType) ||
 		typeof body.voterId !== "string" || !isValidShareId(body.voterId) || typeof body.voted !== "boolean") {
 		return c.json({ error: "Vote update is invalid." }, 400);
 	}
@@ -497,15 +523,24 @@ app.post("/api/searches/:id/votes", async (c) => {
 		const search = await readSearch(c.env.DB, id);
 		if (!search) return c.json({ error: "This shared search could not be found." }, 404);
 		if (!snapshotHasVenue(search.snapshot, body.venueId)) return c.json({ error: "That venue is not part of this search." }, 404);
+		const category = body.category as VenueType;
+		if (!search.snapshot.results[category].some((venue) => venue.id === body.venueId)) {
+			return c.json({ error: "That venue is not part of this category." }, 400);
+		}
 		const shortlistEntry = await c.env.DB.prepare("SELECT venue_id FROM shortlist WHERE search_id = ? AND venue_id = ?")
 			.bind(id, body.venueId).first();
 		if (!shortlistEntry) return c.json({ error: "Add the venue to the shortlist before voting." }, 409);
 		if (body.voted) {
-			await c.env.DB.prepare("INSERT OR IGNORE INTO votes (search_id, venue_id, voter_id, created_at) VALUES (?, ?, ?, ?)")
-				.bind(id, body.venueId, body.voterId, Date.now()).run();
+			await c.env.DB.prepare(`
+				INSERT INTO category_votes (search_id, category, venue_id, voter_id, created_at)
+				VALUES (?, ?, ?, ?, ?)
+				ON CONFLICT(search_id, category, voter_id) DO UPDATE SET
+					venue_id = excluded.venue_id,
+					created_at = excluded.created_at
+			`).bind(id, category, body.venueId, body.voterId, Date.now()).run();
 		} else {
-			await c.env.DB.prepare("DELETE FROM votes WHERE search_id = ? AND venue_id = ? AND voter_id = ?")
-				.bind(id, body.venueId, body.voterId).run();
+			await c.env.DB.prepare("DELETE FROM category_votes WHERE search_id = ? AND category = ? AND venue_id = ? AND voter_id = ?")
+				.bind(id, category, body.venueId, body.voterId).run();
 		}
 		return c.json({ ok: true });
 	} catch {

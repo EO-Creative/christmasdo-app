@@ -31,22 +31,18 @@ class MemoryD1 {
 	}
 
 	all(query, values) {
-		if (!query.includes("SELECT s.venue_id, s.added_at")) return [];
-		const voterId = values[0];
-		const searchId = values[1];
+		if (!query.includes("FROM shortlist AS s") || !query.includes("category_votes")) return [];
+		const searchId = values[0];
 		return [...this.shortlist.entries()]
 			.filter(([key]) => key.startsWith(`${searchId}:`))
-			.map(([key, addedAt]) => {
+			.flatMap(([key, addedAt]) => {
 				const venueId = key.slice(searchId.length + 1);
-				const venueVotes = [...this.votes.entries()].filter(([voteKey]) => voteKey.startsWith(`${searchId}:${venueId}:`));
-				return {
-					venue_id: venueId,
-					added_at: addedAt,
-					vote_count: venueVotes.length,
-					voted_by_me: venueVotes.some(([voteKey]) => voteKey.endsWith(`:${voterId}`)) ? 1 : 0,
-				};
+				const venueVotes = [...this.votes.values()].filter((vote) => vote.searchId === searchId && vote.venueId === venueId);
+				return venueVotes.length
+					? venueVotes.map((vote) => ({ venue_id: venueId, added_at: addedAt, category: vote.category, voter_id: vote.voterId }))
+					: [{ venue_id: venueId, added_at: addedAt, category: null, voter_id: null }];
 			})
-			.sort((first, second) => second.vote_count - first.vote_count || first.added_at - second.added_at);
+			.sort((first, second) => first.added_at - second.added_at);
 	}
 
 	run(query, values) {
@@ -57,11 +53,16 @@ class MemoryD1 {
 		} else if (query.includes("DELETE FROM shortlist")) {
 			const key = `${values[0]}:${values[1]}`;
 			this.shortlist.delete(key);
-			for (const voteKey of this.votes.keys()) if (voteKey.startsWith(`${key}:`)) this.votes.delete(voteKey);
-		} else if (query.includes("INSERT OR IGNORE INTO votes")) {
-			this.votes.set(`${values[0]}:${values[1]}:${values[2]}`, values[3]);
-		} else if (query.includes("DELETE FROM votes")) {
-			this.votes.delete(`${values[0]}:${values[1]}:${values[2]}`);
+			for (const [voteKey, vote] of this.votes) {
+				if (vote.searchId === values[0] && vote.venueId === values[1]) this.votes.delete(voteKey);
+			}
+		} else if (query.includes("INSERT INTO category_votes")) {
+			const [searchId, category, venueId, voterId, createdAt] = values;
+			this.votes.set(`${searchId}:${category}:${voterId}`, { searchId, category, venueId, voterId, createdAt });
+		} else if (query.includes("DELETE FROM category_votes")) {
+			const [searchId, category, venueId, voterId] = values;
+			const key = `${searchId}:${category}:${voterId}`;
+			if (this.votes.get(key)?.venueId === venueId) this.votes.delete(key);
 		}
 		return { success: true };
 	}
@@ -84,6 +85,27 @@ const testSnapshot = {
 			tags: { name: "Test Restaurant" },
 		}],
 		drinks: [],
+	},
+};
+
+const activityVenue = {
+	...testSnapshot.results.food[0],
+	id: "activity-1",
+	category: "bowling alley",
+	tags: { name: "Bowling" },
+};
+
+const multiCategorySnapshot = {
+	...testSnapshot,
+	types: ["activities", "food", "drinks"],
+	results: {
+		activities: [activityVenue],
+		food: [
+			testSnapshot.results.food[0],
+			{ ...testSnapshot.results.food[0], id: "restaurant-2", tags: { name: "Second Restaurant" } },
+			activityVenue,
+		],
+		drinks: [{ ...testSnapshot.results.food[0], id: "pub-1", category: "pub", tags: { name: "Pub" } }],
 	},
 };
 
@@ -449,77 +471,81 @@ test("shared-search creation validates snapshots and requires D1", async () => {
 	}
 });
 
-test("shared shortlist and votes persist, remain idempotent, and cannot target unknown venues", async () => {
+test("shared shortlist allows one replaceable vote per category and browser", async () => {
 	const database = new MemoryD1();
 	const create = await app.request("/api/searches", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(testSnapshot),
+		body: JSON.stringify(multiCategorySnapshot),
 	}, { DB: database });
 	assert.equal(create.status, 201);
 	const { id } = await create.json();
 	assert.match(id, /^[\da-f-]{36}$/i);
 
 	const voterId = "123e4567-e89b-42d3-a456-426614174000";
-	const unknownVenue = await app.request(`/api/searches/${id}/shortlist`, {
+	const addShortlisted = async (venueId) => app.request(`/api/searches/${id}/shortlist`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ venueId, action: "add" }),
+	}, { DB: database });
+	for (const venueId of ["activity-1", "restaurant-1", "restaurant-2", "pub-1"]) {
+		assert.equal((await addShortlisted(venueId)).status, 200);
+	}
+	assert.equal((await app.request(`/api/searches/${id}/shortlist`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ venueId: "not-in-search", action: "add" }),
-	}, { DB: database });
-	assert.equal(unknownVenue.status, 404);
+	}, { DB: database })).status, 404);
 
-	const voteBeforeShortlist = await app.request(`/api/searches/${id}/votes`, {
+	const vote = (venueId, category, voted = true) => app.request(`/api/searches/${id}/votes`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ venueId: "restaurant-1", voterId, voted: true }),
+		body: JSON.stringify({ venueId, category, voterId, voted }),
 	}, { DB: database });
-	assert.equal(voteBeforeShortlist.status, 409);
-
-	for (let index = 0; index < 2; index++) {
-		const add = await app.request(`/api/searches/${id}/shortlist`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ venueId: "restaurant-1", action: "add" }),
-		}, { DB: database });
-		assert.equal(add.status, 200);
-	}
-	for (let index = 0; index < 2; index++) {
-		const vote = await app.request(`/api/searches/${id}/votes`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ venueId: "restaurant-1", voterId, voted: true }),
-		}, { DB: database });
-		assert.equal(vote.status, 200);
-	}
+	assert.equal((await vote("activity-1", "activities")).status, 200);
+	assert.equal((await vote("activity-1", "food")).status, 200);
+	const multiCategoryVote = await app.request(`/api/searches/${id}?voterId=${voterId}`, {}, { DB: database });
+	const multiCategoryEntry = (await multiCategoryVote.json()).shortlist.find(({ venueId }) => venueId === "activity-1");
+	assert.deepEqual(multiCategoryEntry.votes, { activities: 1, food: 1, drinks: 0 });
+	assert.deepEqual(multiCategoryEntry.votedByMe.toSorted(), ["activities", "food"]);
+	assert.equal((await vote("restaurant-1", "food")).status, 200);
+	assert.equal((await vote("restaurant-1", "food")).status, 200);
+	assert.equal((await vote("pub-1", "drinks")).status, 200);
+	assert.equal((await vote("restaurant-2", "food")).status, 200);
+	assert.equal((await vote("restaurant-1", "drinks")).status, 400);
+	assert.equal((await vote("not-in-search", "food")).status, 404);
 
 	const shared = await app.request(`/api/searches/${id}?voterId=${voterId}`, {}, { DB: database });
 	assert.equal(shared.status, 200);
 	const sharedData = await shared.json();
 	assert.equal(sharedData.snapshot.location.label, "York, UK");
-	assert.deepEqual(sharedData.shortlist.map(({ venueId, votes, votedByMe }) => ({ venueId, votes, votedByMe })), [
-		{ venueId: "restaurant-1", votes: 1, votedByMe: true },
+	assert.deepEqual(sharedData.shortlist.map(({ venueId, votes, votedByMe }) => ({ venueId, votes, votedByMe }))
+		.sort((first, second) => first.venueId.localeCompare(second.venueId)), [
+		{ venueId: "activity-1", votes: { activities: 1, food: 0, drinks: 0 }, votedByMe: ["activities"] },
+		{ venueId: "pub-1", votes: { activities: 0, food: 0, drinks: 1 }, votedByMe: ["drinks"] },
+		{ venueId: "restaurant-1", votes: { activities: 0, food: 0, drinks: 0 }, votedByMe: [] },
+		{ venueId: "restaurant-2", votes: { activities: 0, food: 1, drinks: 0 }, votedByMe: ["food"] },
 	]);
 
 	const secondVoter = await app.request(`/api/searches/${id}?voterId=123e4567-e89b-42d3-a456-426614174001`, {}, { DB: database });
 	const secondVoterData = await secondVoter.json();
-	assert.equal(secondVoterData.shortlist[0].votes, 1);
-	assert.equal(secondVoterData.shortlist[0].votedByMe, false);
+	assert.equal(secondVoterData.shortlist.find(({ venueId }) => venueId === "restaurant-2").votes.food, 1);
+	assert.deepEqual(secondVoterData.shortlist.find(({ venueId }) => venueId === "restaurant-2").votedByMe, []);
 
-	const removeVote = await app.request(`/api/searches/${id}/votes`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ venueId: "restaurant-1", voterId, voted: false }),
-	}, { DB: database });
-	assert.equal(removeVote.status, 200);
+	assert.equal((await vote("restaurant-2", "food", false)).status, 200);
+	assert.equal((await vote("activity-1", "activities", false)).status, 200);
 
 	const removeFromShortlist = await app.request(`/api/searches/${id}/shortlist`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ venueId: "restaurant-1", action: "remove" }),
+		body: JSON.stringify({ venueId: "pub-1", action: "remove" }),
 	}, { DB: database });
 	assert.equal(removeFromShortlist.status, 200);
 	const emptyShortlist = await app.request(`/api/searches/${id}?voterId=${voterId}`, {}, { DB: database });
-	assert.deepEqual((await emptyShortlist.json()).shortlist, []);
+	const remaining = (await emptyShortlist.json()).shortlist;
+	assert.equal(remaining.find(({ venueId }) => venueId === "pub-1"), undefined);
+	assert.equal(remaining.find(({ venueId }) => venueId === "restaurant-2").votes.food, 0);
+	assert.equal(remaining.find(({ venueId }) => venueId === "activity-1").votes.activities, 0);
 });
 
 test("shared-search routes report missing records and validate ids and votes", async () => {

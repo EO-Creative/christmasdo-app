@@ -4,7 +4,7 @@ A small React app that helps an office group shortlist potential venues for a Ch
 
 Results are split into separate lists for each selected type, each containing up to 20 Geoapify places within the chosen 1, 2, 5, 10, or 20 km radius. This allows a popular category to have its own results rather than crowding out the others. Geoapify does not provide dependable customer ratings for these listings, so each list is ordered by listed capacity suitability and then distance; no rating is fabricated. Food searches focus on restaurants rather than cafés and food courts; obvious café and fast-food brands or classifications are filtered. Listings with a numeric capacity below the submitted group size are omitted. These are practical heuristics, not a group-booking guarantee.
 
-Each completed search is saved as a snapshot and given a shareable URL. Anyone with the link can add/remove venues from the shared shortlist and vote on shortlisted venues; changes refresh automatically about every 30 seconds, or can be refreshed manually. The snapshot does not change when a provider's listings change; run a new search to create an updated share link.
+Each completed search is saved as a snapshot and given a shareable URL. The shared shortlist and its category-by-category votes appear before the search form on a shared link. Anyone with the link can add/remove venues from the shared shortlist and vote; each browser identity can select one shortlisted venue per selected category, and can change that choice. Changes refresh automatically about every 30 seconds, or can be refreshed manually. The snapshot does not change when a provider's listings change; run a new search to create an updated share link.
 
 Address, phone, website, and capacity information may be missing, incomplete, or out of date. Confirm details and availability with venues directly. Place lookup is powered by [Geoapify](https://www.geoapify.com/); map links open [OpenStreetMap](https://www.openstreetmap.org/copyright).
 
@@ -50,8 +50,9 @@ npm run build
 
 ## Shared searches and voting
 
-- Search snapshots, shortlist membership, and votes are stored in D1. Share links are opaque random IDs; anyone who has a link can view and edit that search's shortlist.
-- Voting uses a random browser identifier stored in local storage, not sign-in or verified identity. Votes are one-per-venue per browser profile and can be changed or removed; clearing local storage or using another browser creates another voting identity.
+- Search snapshots, shortlist membership, and category-specific votes are stored in D1. Share links are opaque random IDs; anyone who has a link can view and edit that search's shortlist.
+- Voting uses a random browser identifier stored in local storage, not sign-in or verified identity. Ordinary page refreshes keep that ID, and the server enforces one selected venue per category for each supplied ID; however, a determined user can clear/change browser storage, use another browser/device, or call the API with another ID. This is a lightweight poll, not fraud-proof or identity-verified voting.
+- Existing votes are migrated to their matching categories. If an old browser had voted for multiple venues in one category, the migration retains the newest vote (with a deterministic venue-ID tie-break) for that category.
 - Search links do not currently expire automatically. They remain in D1 until records are manually removed, and each new search creates a separate snapshot.
 - `wrangler.json` binds `DB` to the `christmasdo-db` database in the EO Creative Cloudflare account. Apply migrations with `npx wrangler d1 migrations apply christmasdo-db --remote` before deploying schema changes; remote operations require Cloudflare authentication. For another account, create a database there and replace `database_id` with its ID.
 

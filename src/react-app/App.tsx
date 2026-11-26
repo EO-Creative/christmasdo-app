@@ -53,8 +53,8 @@ interface VenueSearchResponse {
 interface ShortlistItem {
 	venueId: string;
 	addedAt: number;
-	votes: number;
-	votedByMe: boolean;
+	votes: Record<VenueType, number>;
+	votedByMe: VenueType[];
 }
 
 interface SharedSearchResponse {
@@ -128,7 +128,7 @@ function App() {
 	const [types, setTypes] = useState({ activities: false, food: false, drinks: false });
 	const [radiusKm, setRadiusKm] = useState(5);
 	const [results, setResults] = useState<Record<VenueType, Venue[]>>({ activities: [], food: [], drinks: [] });
-	const [shareId, setShareId] = useState("");
+	const [shareId, setShareId] = useState(() => new URLSearchParams(window.location.search).get("share") || "");
 	const [voterId, setVoterId] = useState("");
 	const [shortlist, setShortlist] = useState<ShortlistItem[]>([]);
 	const [refreshingShare, setRefreshingShare] = useState(false);
@@ -376,6 +376,10 @@ function App() {
 		item,
 		venue: allResults.find((candidate) => candidate.id === item.venueId),
 	})).filter((entry): entry is { item: ShortlistItem; venue: Venue } => Boolean(entry.venue));
+	const shortlistedVenuesByType = (type: VenueType) => shortlist.flatMap((item) => {
+		const venue = results[type].find((candidate) => candidate.id === item.venueId);
+		return venue ? [{ item, venue }] : [];
+	}).sort((first, second) => second.item.votes[type] - first.item.votes[type] || first.item.addedAt - second.item.addedAt);
 	const shareUrl = shareId ? new URL(`?share=${encodeURIComponent(shareId)}`, window.location.href).href : "";
 
 	const refreshVotes = async () => {
@@ -409,7 +413,7 @@ function App() {
 		}
 	};
 
-	const toggleVote = async (venueId: string, voted: boolean) => {
+	const toggleVote = async (venueId: string, category: VenueType, voted: boolean) => {
 		if (!shareId || !voterId) return;
 		setBusyVenueId(venueId);
 		setShareError("");
@@ -417,7 +421,7 @@ function App() {
 			await requestJson(`/api/searches/${encodeURIComponent(shareId)}/votes`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ venueId, voterId, voted: !voted }),
+				body: JSON.stringify({ venueId, category, voterId, voted: !voted }),
 			});
 			await loadSharedSearch(shareId, voterId, false);
 		} catch (caughtError) {
@@ -454,6 +458,8 @@ function App() {
 		const phoneLink = venue.tags.phone?.replace(/[^\d+]/g, "");
 		const mapUrl = `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=17/${lat}/${lon}`;
 		const isShortlisted = Boolean(shortlistItem);
+		const votedByMe = shortlistItem?.votedByMe.includes(categoryType) ?? false;
+		const alreadyVotedInCategory = shortlist.some((item) => item.votedByMe.includes(categoryType));
 
 		return (
 			<article className="venue-card" key={`${categoryType}-${venue.id}`}>
@@ -489,11 +495,11 @@ function App() {
 						{shortlistItem && (
 							<button
 								type="button"
-								className={shortlistItem.votedByMe ? "vote-button voted" : "vote-button"}
+								className={votedByMe ? "vote-button voted" : "vote-button"}
 								disabled={busyVenueId === venue.id}
-								onClick={() => toggleVote(venue.id, shortlistItem.votedByMe)}
+								onClick={() => toggleVote(venue.id, categoryType, votedByMe)}
 							>
-								{shortlistItem.votedByMe ? "Your vote · " : "Vote · "}{shortlistItem.votes}
+								{votedByMe ? "Your vote · " : alreadyVotedInCategory ? "Change vote · " : "Vote · "}{shortlistItem.votes[categoryType]}
 							</button>
 						)}
 					</div>
@@ -504,6 +510,54 @@ function App() {
 
 	return (
 		<div className="container">
+			{shareId && (
+				<section className="shortlist-section shared-shortlist" aria-labelledby="shortlist-heading">
+					<div className="category-heading">
+						<div>
+							<p className="step-label">Group decision</p>
+							<h2 id="shortlist-heading">Shortlist and votes</h2>
+						</div>
+						<span>{shortlistedVenues.length} selected</span>
+					</div>
+					{searchedLocation && <p className="results-context">{searchedLocation} · {searchedGroupSize} people · {searchedRadiusKm} km radius</p>}
+					<div className="share-panel">
+						<div>
+							<h3>Share and decide together</h3>
+							<p>Anyone with this link can add venues to the shortlist and vote. Each browser can choose one venue per category.</p>
+						</div>
+						<div className="share-link-row">
+							<input aria-label="Shareable search link" readOnly value={shareUrl} onFocus={(event) => event.currentTarget.select()} />
+							<button type="button" className="share-button" onClick={copyShareLink}>{copied ? "Copied" : "Copy link"}</button>
+							<button type="button" className="refresh-button" onClick={refreshVotes} disabled={refreshingShare || !voterId}>
+								{refreshingShare ? "Refreshing…" : "Refresh votes"}
+							</button>
+						</div>
+						<p className="share-note">A normal refresh keeps this browser’s local voting ID. It is not identity-verified; clearing browser storage or switching browsers can create another vote identity.</p>
+					</div>
+					{error && <p className="error share-error" role="alert">{error}</p>}
+					{shareError && <p className="error share-error" role="alert">{shareError}</p>}
+					{!hasSearched ? (
+						<p className="loading-message">Loading the shared shortlist…</p>
+					) : searchedTypes.map((type) => {
+						const entries = shortlistedVenuesByType(type);
+						const voteCount = shortlist.reduce((total, item) => total + item.votes[type], 0);
+						return (
+							<section className="shortlist-category" key={type} aria-labelledby={`shortlist-${type}-heading`}>
+								<div className="category-heading">
+									<h3 id={`shortlist-${type}-heading`}>{venueTypeLabels[type]}</h3>
+									<span>{voteCount} {voteCount === 1 ? "vote" : "votes"}</span>
+								</div>
+								{entries.length ? (
+									<div className="venue-list">
+										{entries.map(({ item, venue }) => renderVenueCard(venue, type, item))}
+									</div>
+								) : <p className="category-empty">No {venueTypeLabels[type].toLowerCase()} venues shortlisted yet.</p>}
+							</section>
+						);
+					})}
+				</section>
+			)}
+
 			<header className="hero">
 				<p className="eyebrow">A little planning, a lot of festive cheer</p>
 				<h1>Find your night-out spot</h1>
@@ -636,7 +690,7 @@ function App() {
 							<p>Try a larger search radius, a nearby town or city, or different venue types.</p>
 						</div>
 					)}
-					{!loading && shareError && <p className="error share-error" role="alert">{shareError}</p>}
+					{!loading && shareError && !shareId && <p className="error share-error" role="alert">{shareError}</p>}
 					{hasSearched && !loading && (allResults.length > 0 || shareId !== "") && (
 						<>
 							<div className="results-heading">
@@ -650,22 +704,6 @@ function App() {
 								Showing separate lists for {selectedLabels.join(", ")}. Geoapify does not provide dependable customer ratings for these listings, so venues are ordered by listed capacity suitability and distance.
 								Known capacities below {searchedGroupSize} are omitted. Details may be incomplete; confirm group bookings directly.
 							</p>
-							{shareId && (
-								<div className="share-panel">
-									<div>
-										<h3>Share and decide together</h3>
-										<p>Anyone with this link can add venues to the shortlist and vote. Votes are anonymous and stored per browser.</p>
-									</div>
-									<div className="share-link-row">
-										<input aria-label="Shareable search link" readOnly value={shareUrl} onFocus={(event) => event.currentTarget.select()} />
-										<button type="button" className="share-button" onClick={copyShareLink}>{copied ? "Copied" : "Copy link"}</button>
-										<button type="button" className="refresh-button" onClick={refreshVotes} disabled={refreshingShare}>
-											{refreshingShare ? "Refreshing…" : "Refresh votes"}
-										</button>
-									</div>
-									<p className="share-note">A share link allows anyone who has it to edit the shortlist. Browser-based votes are not identity verified.</p>
-								</div>
-							)}
 							{!shareId && shareError && <p className="share-warning" role="status">Results are shown, but sharing is currently unavailable.</p>}
 							{searchedTypes.map((type) => (
 								<section className="category-results" key={type} aria-labelledby={`${type}-heading`}>
@@ -684,24 +722,6 @@ function App() {
 									) : <p className="category-empty">No matches in this category within {searchedRadiusKm} km.</p>}
 								</section>
 							))}
-							<section className="shortlist-section" aria-labelledby="shortlist-heading">
-								<div className="category-heading">
-									<div>
-										<p className="step-label">Group decision</p>
-										<h3 id="shortlist-heading">Shortlist and votes</h3>
-									</div>
-									<span>{shortlistedVenues.length} selected</span>
-								</div>
-								{shortlistedVenues.length ? (
-									<div className="venue-list">
-										{shortlistedVenues.map(({ item, venue }) => renderVenueCard(
-											venue,
-											venueTypes.find((type) => results[type].some((candidate) => candidate.id === venue.id)) || "food",
-											item,
-										))}
-									</div>
-								) : <p className="category-empty">Add venues from the lists above to compare them and vote.</p>}
-							</section>
 						</>
 					)}
 				</section>
