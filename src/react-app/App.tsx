@@ -625,14 +625,14 @@ function App() {
 												: "none recognized yet; choose categories below for a broad search"}
 											. You can edit these choices.
 										</p>
-								{promptIntent.details.length > 0 && <p>Specific filters (if their category is selected): {promptIntent.details.join(", ")}.</p>}
+										{promptIntent.details.length > 0 && <p>Interpreted as (if their category is selected): {promptIntent.details.join(", ")}.</p>}
 										{promptIntent.limitations.length > 0 && (
 											<ul>
 												{promptIntent.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
 											</ul>
 										)}
 									</>
-								) : <p>Supported activity and cuisine phrases can narrow results; you can also choose categories below.</p>}
+								) : <p>Known venue references such as Flight Club and supported activity or cuisine phrases can suggest searches; you can also choose categories below.</p>}
 							</div>
 						</div>
 						<div className="input-row">

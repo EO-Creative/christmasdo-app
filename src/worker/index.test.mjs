@@ -369,6 +369,131 @@ test("venue search interprets sports and cuisine preferences as supported Geoapi
 	]);
 });
 
+test("Flight Club-style searches keep Italian food separate and add only evidence-backed game bars to activities", async () => {
+	const queriedCategories = [];
+	await withMockedFetch(async (input) => {
+		const categories = new URL(String(input)).searchParams.get("categories").split(",");
+		queriedCategories.push(categories);
+		if (categories.includes("catering.restaurant.italian")) {
+			return Response.json({ features: [{ properties: {
+				place_id: "italian",
+				name: "Italian Kitchen",
+				categories: ["catering.restaurant.italian"],
+				lat: 53.96,
+				lon: -1.08,
+			} }] });
+		}
+		if (categories.includes("entertainment.bowling_alley")) {
+			return Response.json({ features: [
+				{ properties: {
+					place_id: "bowling",
+					name: "Bowling Social",
+					categories: ["entertainment.bowling_alley"],
+					lat: 53.96,
+					lon: -1.08,
+				} },
+				{ properties: {
+					place_id: "darts-pub",
+					name: "Darts Pub",
+					categories: ["entertainment.amusement_arcade", "catering.pub"],
+					lat: 53.961,
+					lon: -1.08,
+					distance: 200,
+					datasource: { raw: { sport: "darts", capacity: "12" } },
+				} },
+			] });
+		}
+		return Response.json({ features: [
+			{ properties: {
+				place_id: "darts-pub",
+				name: "Darts Pub",
+				categories: ["catering.pub"],
+				lat: 53.961,
+				lon: -1.08,
+				distance: 200,
+				datasource: { raw: { sport: "darts", capacity: "12" } },
+			} },
+			{ properties: {
+				place_id: "flight-club",
+				name: "Flight Club",
+				categories: ["catering.bar"],
+				lat: 53.9605,
+				lon: -1.08,
+				distance: 100,
+				datasource: { raw: { capacity: "12" } },
+			} },
+			{ properties: {
+				place_id: "ordinary-pub",
+				name: "Ordinary Pub",
+				categories: ["catering.pub"],
+				lat: 53.962,
+				lon: -1.08,
+			} },
+			{ properties: {
+				place_id: "small-darts-pub",
+				name: "Small Darts Pub",
+				categories: ["catering.pub"],
+				lat: 53.963,
+				lon: -1.08,
+				datasource: { raw: { game: "darts", capacity: "8" } },
+			} },
+		] });
+	}, async () => {
+		const params = new URLSearchParams({
+			lat: "53.96",
+			lon: "-1.08",
+			types: "activities,food",
+			groupSize: "10",
+			radiusKm: "5",
+			prompt: "We liked flight club last time, so something simliar to that. The team has suggested Italian as an easy option, and then they can make their own arrangements if they want to go clubbing afterwards",
+		});
+		const response = await app.request(`/api/venues?${params}`, {}, bindings);
+		assert.equal(response.status, 200);
+		const { results } = await response.json();
+		assert.deepEqual(results.activities.map((venue) => venue.tags.name), ["Flight Club", "Darts Pub", "Bowling Social"]);
+		assert.equal(results.activities.filter((venue) => venue.id === "darts-pub").length, 1);
+		assert.deepEqual(results.food.map((venue) => venue.tags.name), ["Italian Kitchen"]);
+		assert.deepEqual(results.drinks, []);
+	});
+	assert.deepEqual(queriedCategories, [
+		["entertainment.bowling_alley", "entertainment.miniature_golf", "entertainment.amusement_arcade"],
+		["catering.restaurant.italian"],
+		["catering.bar", "catering.biergarten", "catering.pub", "adult.nightclub"],
+	]);
+});
+
+test("social-game searches reuse the selected Drinks results for evidence-backed game bars", async () => {
+	const queriedCategories = [];
+	await withMockedFetch(async (input) => {
+		const categories = new URL(String(input)).searchParams.get("categories").split(",");
+		queriedCategories.push(categories);
+		const isActivities = categories.includes("entertainment.bowling_alley");
+		return Response.json({ features: [{ properties: {
+			place_id: isActivities ? "bowling" : "darts-pub",
+			name: isActivities ? "Bowling Social" : "Darts Pub",
+			categories: isActivities ? ["entertainment.bowling_alley"] : ["catering.pub"],
+			lat: 53.96,
+			lon: -1.08,
+			...(isActivities ? {} : { datasource: { raw: { sport: "darts" } } }),
+		} }] });
+	}, async () => {
+		const params = new URLSearchParams({
+			lat: "53.96",
+			lon: "-1.08",
+			types: "activities,drinks",
+			groupSize: "10",
+			radiusKm: "5",
+			prompt: "Flight Club and drinks",
+		});
+		const response = await app.request(`/api/venues?${params}`, {}, bindings);
+		assert.equal(response.status, 200);
+		const { results } = await response.json();
+		assert.deepEqual(results.activities.map((venue) => venue.tags.name), ["Bowling Social", "Darts Pub"]);
+		assert.deepEqual(results.drinks.map((venue) => venue.tags.name), ["Darts Pub"]);
+	});
+	assert.equal(queriedCategories.length, 2);
+});
+
 test("single-category venue searches only request relevant provider categories and allow empty results", async () => {
 	await withMockedFetch(async (input) => {
 		const url = new URL(String(input));

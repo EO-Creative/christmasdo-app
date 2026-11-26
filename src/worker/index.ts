@@ -30,7 +30,7 @@ const filteredFoodCategories = ["catering.cafe", "catering.fast_food", "catering
 const unsuitableVenueName = /\b(?:costa(?:\s+(?:coffee|express))?|starbucks|caff[eè]?\s*nero|nero|pret(?:\s+a)?\s+manger|greggs|tim\s+hortons|mcdonald[’']?s|burger\s+king|kfc|subway|taco\s+bell|pizza\s+hut|domino[’']?s|papa\s+john[’']s)\b/i;
 
 function requestedCategories(type: VenueType, intent: SearchIntent): string[] {
-	if (type === "activities" && intent.activityCategories.length > 0) return intent.activityCategories;
+	if (type === "activities" && (intent.activityCategories.length > 0 || intent.socialGames)) return intent.activityCategories;
 	if (type === "food" && intent.cuisineCategories.length > 0) return intent.cuisineCategories;
 	return categoriesByType[type];
 }
@@ -164,6 +164,27 @@ function isUnsuitableVenue(value: unknown, requestedCategories: string[], groupS
 	return categories.some((category) => filteredFoodCategories.some((filtered) =>
 		category === filtered || category.startsWith(`${filtered}.`),
 	)) || (typeof place.name === "string" && unsuitableVenueName.test(place.name));
+}
+
+function hasSocialGamesEvidence(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	const place = value as GeoapifyPlace;
+	const name = typeof place.name === "string" ? place.name : "";
+	if (/\bflight\s*club\b/i.test(name)) return true;
+
+	const categories = Array.isArray(place.categories)
+		? place.categories.filter((category): category is string => typeof category === "string")
+		: [];
+	const raw = place.datasource?.raw ?? {};
+	if (Object.entries(raw).some(([key, item]) =>
+		/^(?:game|sport):(darts|billiards|snooker|pool|table_tennis|shuffleboard)$/i.test(key) &&
+		(typeof item === "string" && /^(?:yes|designated)$/i.test(item.trim()) || item === true),
+	)) return true;
+	const gameTags = ["sport", "game", "games", "leisure", "description", "description:en", "name:en", "brand"]
+		.map((key) => raw[key])
+		.filter((item): item is string => typeof item === "string");
+	const evidence = [...categories, name, ...gameTags].join(" ");
+	return /\b(?:darts?|dartboards?|billiards?|snooker|pool\s+tables?|table[ _]tennis|ping[ -]?pong|shuffleboard|bowling|arcades?)\b/i.test(evidence);
 }
 
 type NormalizedVenue = NonNullable<ReturnType<typeof venueResult>>;
@@ -361,8 +382,7 @@ app.get("/api/venues", async (c) => {
 	const intent = parseSearchIntent(prompt);
 	const selectedCategories = types.flatMap((type) => requestedCategories(type as VenueType, intent));
 	try {
-		const categoryResults = await Promise.all(types.map(async (type) => {
-			const categories = requestedCategories(type as VenueType, intent);
+		const fetchPlaces = async (categories: string[]): Promise<unknown[]> => {
 			const params = new URLSearchParams({
 				apiKey,
 				categories: categories.join(","),
@@ -377,7 +397,13 @@ app.get("/api/venues", async (c) => {
 			if (!response.ok) throw new Error("Venue provider unavailable");
 			const data: unknown = await response.json();
 			if (!isRecord(data) || !Array.isArray(data.features)) throw new Error("Venue search returned an invalid response.");
-			const elements = data.features
+			return data.features;
+		};
+
+		const categoryResults = await Promise.all(types.map(async (type) => {
+			const categories = requestedCategories(type as VenueType, intent);
+			const features = categories.length ? await fetchPlaces(categories) : [];
+			const elements = features
 				.map((feature) => {
 					const properties = isRecord(feature) ? feature.properties : undefined;
 					const venue = venueResult(properties, categories, latitude, longitude);
@@ -386,10 +412,25 @@ app.get("/api/venues", async (c) => {
 				.filter((venue): venue is NormalizedVenue => venue !== undefined)
 				.sort(sortVenueCandidates)
 				.slice(0, 20);
-			return [type, elements] as const;
+			return [type, elements, features] as const;
 		}));
 		const results = Object.fromEntries(categoryResults) as Record<VenueType, NormalizedVenue[]>;
 		for (const type of venueTypes) results[type] ??= [];
+		if (intent.socialGames && types.includes("activities")) {
+			const drinksFeatures = categoryResults.find(([type]) => type === "drinks")?.[2];
+			const barFeatures = drinksFeatures ?? await fetchPlaces(categoriesByType.drinks);
+			const gameBars = barFeatures
+				.map((feature) => {
+					const properties = isRecord(feature) ? feature.properties : undefined;
+					if (!hasSocialGamesEvidence(properties)) return undefined;
+					const venue = venueResult(properties, categoriesByType.drinks, latitude, longitude);
+					return venue && !isUnsuitableVenue(properties, selectedCategories, groupSize, venue.tags.capacity) ? venue : undefined;
+				})
+				.filter((venue): venue is NormalizedVenue => venue !== undefined);
+			results.activities = [...new Map([...results.activities, ...gameBars].map((venue) => [venue.id, venue])).values()]
+				.sort(sortVenueCandidates)
+				.slice(0, 20);
+		}
 		return c.json({ results });
 	} catch (error) {
 		if (error instanceof Error && error.message === "Venue search returned an invalid response.") {

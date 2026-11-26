@@ -15,13 +15,44 @@ interface ResultsMapProps<TVenue extends MapVenue> {
 	renderVenueCard: (venue: TVenue, type: VenueType) => ReactNode;
 }
 
+interface MapMarker {
+	key: string;
+	lat: number;
+	lon: number;
+	names: string[];
+	categoryTypes: VenueType[];
+}
+
 export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenueCard }: ResultsMapProps<TVenue>) {
 	const mapElement = useRef<HTMLDivElement>(null);
 	const mapRef = useRef<L.Map | null>(null);
 	const markerLayerRef = useRef<L.LayerGroup | null>(null);
-	const [selectedGroupKey, setSelectedGroupKey] = useState("");
+	const markerElementsRef = useRef(new Map<string, HTMLElement>());
+	const closeButtonRef = useRef<HTMLButtonElement>(null);
+	const [selection, setSelection] = useState<{ key: string } | null>(null);
 	const groups = useMemo(() => groupMapVenues(venues), [venues]);
-	const selectedGroup = groups.find((group) => group.key === selectedGroupKey);
+	const selectedGroup = groups.find((group) => group.key === selection?.key);
+	const markerData = JSON.stringify(groups.map((group) => ({
+		key: group.key,
+		lat: group.lat,
+		lon: group.lon,
+		names: [...new Set(group.entries.map(({ venue }) => venue.tags.name || "Unnamed venue"))].sort(),
+		categoryTypes: [...group.categoryTypes].sort(),
+	})).sort((a, b) => a.key.localeCompare(b.key)));
+	const coordinateData = JSON.stringify(venues.flatMap(({ venue }) => {
+		const coordinates = getVenueCoordinates(venue);
+		return coordinates ? [[coordinates.lat, coordinates.lon]] : [];
+	}).sort((a, b) => a[0] - b[0] || a[1] - b[1])
+		.filter((point, index, points) => index === 0 || point[0] !== points[index - 1][0] || point[1] !== points[index - 1][1]));
+
+	const closeFlyover = () => {
+		if (selection) markerElementsRef.current.get(selection.key)?.focus();
+		setSelection(null);
+	};
+
+	useEffect(() => {
+		if (selection) closeButtonRef.current?.focus();
+	}, [selection]);
 
 	useEffect(() => {
 		if (!mapElement.current) return;
@@ -34,9 +65,11 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 		const markerLayer = L.layerGroup().addTo(map);
 		mapRef.current = map;
 		markerLayerRef.current = markerLayer;
-		window.requestAnimationFrame(() => map.invalidateSize());
+		map.on("click", () => setSelection(null));
+		const frame = window.requestAnimationFrame(() => map.invalidateSize());
 
 		return () => {
+			window.cancelAnimationFrame(frame);
 			map.remove();
 			mapRef.current = null;
 			markerLayerRef.current = null;
@@ -49,9 +82,9 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 		if (!map || !markerLayer) return;
 
 		markerLayer.clearLayers();
-		for (const group of groups) {
-			const names = [...new Set(group.entries.map(({ venue }) => venue.tags.name || "Unnamed venue"))];
-			const title = `${names.join(", ")} · ${group.categoryTypes.map((type) => venueTypeLabels[type]).join(", ")}`;
+		markerElementsRef.current.clear();
+		for (const group of JSON.parse(markerData) as MapMarker[]) {
+			const title = `${group.names.join(", ")} · ${group.categoryTypes.map((type) => venueTypeLabels[type]).join(", ")}`;
 			const tooltip = document.createElement("span");
 			tooltip.textContent = title;
 			const dots = group.categoryTypes
@@ -63,20 +96,35 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 				iconSize: [38, 38],
 				iconAnchor: [19, 19],
 			});
-			L.marker([group.lat, group.lon], { icon, keyboard: true, title, alt: title })
+			const marker = L.marker([group.lat, group.lon], { icon, keyboard: true, title, alt: title })
 				.addTo(markerLayer)
-				.bindTooltip(tooltip)
-				.on("click", () => setSelectedGroupKey(group.key));
+				.bindTooltip(tooltip);
+			const selectMarker = () => setSelection({ key: group.key });
+			marker.on("click", selectMarker);
+			const element = marker.getElement();
+			if (element) {
+				element.setAttribute("aria-label", title);
+				element.addEventListener("keydown", (event) => {
+					if (event.key === "Enter" || event.key === " ") {
+						event.preventDefault();
+						event.stopPropagation();
+						selectMarker();
+					}
+				});
+				markerElementsRef.current.set(group.key, element);
+			}
 		}
+	}, [center.lat, center.lon, markerData]);
+
+	useEffect(() => {
+		const map = mapRef.current;
+		if (!map) return;
 
 		const bounds = L.latLngBounds([[center.lat, center.lon]]);
-		for (const { venue } of venues) {
-			const coordinates = getVenueCoordinates(venue);
-			if (coordinates) bounds.extend([coordinates.lat, coordinates.lon]);
-		}
+		for (const [lat, lon] of JSON.parse(coordinateData) as [number, number][]) bounds.extend([lat, lon]);
 		if (bounds.getNorthEast().equals(bounds.getSouthWest())) map.setView([center.lat, center.lon], 13);
 		else map.fitBounds(bounds.pad(0.18), { maxZoom: 14 });
-	}, [center, groups, venues]);
+	}, [center.lat, center.lon, coordinateData]);
 	return (
 		<div className="results-map-panel">
 			<div className="map-legend" aria-label="Map marker categories">
@@ -87,17 +135,32 @@ export function ResultsMap<TVenue extends MapVenue>({ venues, center, renderVenu
 					</span>
 				))}
 			</div>
-			<p className="map-help">Select a marker to see venues at that location. Map tiles are provided by OpenStreetMap.</p>
-			<div className="results-map" ref={mapElement} role="region" aria-label="Interactive map of venue results" />
+			<p className="map-help">Select a marker to see venues at that location. Use Enter or Space on a marker, and Escape to close the details.</p>
+			<div className="results-map-wrapper" onKeyDown={(event) => {
+				if (event.key === "Escape" && selectedGroup) {
+					event.stopPropagation();
+					closeFlyover();
+				}
+			}}>
+				<div className="results-map" ref={mapElement} role="region" aria-label="Interactive map of venue results" />
+				{selectedGroup && (
+					<section className="map-selected-venues" aria-labelledby="map-selected-heading">
+						<div className="map-selected-header">
+							<h3 id="map-selected-heading">Venues at this location</h3>
+							<button type="button" className="map-close-button" ref={closeButtonRef} onClick={closeFlyover} aria-label="Close venue details" aria-describedby="map-selected-heading">×</button>
+						</div>
+						<div className="map-selected-content venue-list">
+							{selectedGroup.entries.map(({ venue, type }) => (
+								<div key={`${type}-${venue.id}`}>
+									<p className="map-venue-category">{venueTypeLabels[type]}</p>
+									{renderVenueCard(venue, type)}
+								</div>
+							))}
+						</div>
+					</section>
+				)}
+			</div>
 			{!groups.length && <p className="category-empty">No venues with valid map coordinates. Use list view to review the results.</p>}
-			{selectedGroup && (
-				<section className="map-selected-venues" aria-live="polite" aria-label="Venues at selected map marker">
-					<h3>{selectedGroup.entries[0].venue.tags.name || "Venues at this location"}</h3>
-					<div className="venue-list">
-						{selectedGroup.entries.map(({ venue, type }) => renderVenueCard(venue, type))}
-					</div>
-				</section>
-			)}
 		</div>
 	);
 }

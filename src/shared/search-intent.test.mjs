@@ -28,6 +28,31 @@ test("recognizes specific activity types and cuisines", () => {
 	assert.deepEqual(intent.cuisineCategories, ["catering.restaurant.thai"]);
 });
 
+test("recognizes Flight Club as social darts without treating optional clubbing as a drinks request", () => {
+	const intent = parseSearchIntent("We liked flight club last time, so something simliar to that. The team has suggested Italian as an easy option, and then they can make their own arrangements if they want to go clubbing afterwards");
+
+	assert.deepEqual(intent.types, ["activities", "food"]);
+	assert.deepEqual(intent.activityCategories, [
+		"entertainment.bowling_alley",
+		"entertainment.miniature_golf",
+		"entertainment.amusement_arcade",
+	]);
+	assert.deepEqual(intent.cuisineCategories, ["catering.restaurant.italian"]);
+	assert.equal(intent.socialGames, true);
+	assert.match(intent.details.join(" "), /social darts/i);
+	assert.ok(intent.limitations.some((limitation) => /exact games and availability/i.test(limitation)));
+	assert.ok(intent.limitations.some((limitation) => /clubbing.*optional later plan.*not suggested/i.test(limitation)));
+});
+
+test("recognizes comparable social-game references and direct darts requests", () => {
+	for (const prompt of ["Something like Puttshack", "A darts bar", "A pool table and Italian food"]) {
+		const intent = parseSearchIntent(prompt);
+		assert.ok(intent.types.includes("activities"), prompt);
+		assert.equal(intent.socialGames, true, prompt);
+		assert.ok(intent.activityCategories.length > 0, prompt);
+	}
+});
+
 test("does not infer excluded categories or cuisines", () => {
 	const intent = parseSearchIntent("No sports or Lebanese food, but drinks are welcome");
 
@@ -36,11 +61,28 @@ test("does not infer excluded categories or cuisines", () => {
 	assert.deepEqual(intent.cuisineCategories, []);
 });
 
+test("respects explicit exclusions of social games and comparable activities", () => {
+	const excluded = parseSearchIntent("No Flight Club or darts, but Italian food");
+	assert.deepEqual(excluded.types, ["food"]);
+	assert.equal(excluded.socialGames, false);
+	const alternatives = parseSearchIntent("No bowling, but something like Flight Club");
+	assert.equal(alternatives.socialGames, true);
+	assert.ok(!alternatives.activityCategories.includes("entertainment.bowling_alley"));
+	assert.ok(alternatives.activityCategories.includes("entertainment.miniature_golf"));
+});
+
+test("includes clubbing when it is a requested part of the night", () => {
+	const intent = parseSearchIntent("We want dinner and clubbing");
+	assert.deepEqual(intent.types, ["food", "drinks"]);
+	assert.ok(!intent.limitations.some((limitation) => /optional later plan/i.test(limitation)));
+});
+
 test("empty or unrecognized requests do not invent venue types", () => {
 	assert.deepEqual(parseSearchIntent(""), {
 		types: [],
 		activityCategories: [],
 		cuisineCategories: [],
+		socialGames: false,
 		details: [],
 		limitations: [],
 	});
@@ -48,6 +90,7 @@ test("empty or unrecognized requests do not invent venue types", () => {
 		types: [],
 		activityCategories: [],
 		cuisineCategories: [],
+		socialGames: false,
 		details: [],
 		limitations: [],
 	});
