@@ -12,7 +12,7 @@ Address, phone, website, and capacity information may be missing, incomplete, or
 
 - Node.js 22.6 or newer (the test command uses Node's built-in TypeScript stripping).
 - A free [Geoapify account and API key](https://myprojects.geoapify.com/) are required.
-- Cloudflare D1 is used to persist shareable search snapshots and votes. Local development uses Wrangler's local D1 database; deploying requires creating a D1 database in your Cloudflare account.
+- Cloudflare D1 is used to persist shareable search snapshots and votes. Local development uses Wrangler's local D1 database; deployment uses the configured remote D1 database.
 
 ## Run locally
 
@@ -29,6 +29,7 @@ npm run dev
 Open the local URL printed by Vite (normally [http://localhost:5173](http://localhost:5173)).
 The `.dev.vars` file is ignored by Git and keeps the key on the server side; do not put it in React code or commit it.
 The Cloudflare Vite plugin also copies local variables to `dist/christmasdo_app/.dev.vars` for preview. Keep that ignored build directory private and never publish or upload it as a generic artifact.
+The configured database ID uses a separate local database from the previous placeholder ID. Old local-only snapshots are not migrated automatically.
 
 ## Verify and build
 
@@ -52,11 +53,11 @@ npm run build
 - Search snapshots, shortlist membership, and votes are stored in D1. Share links are opaque random IDs; anyone who has a link can view and edit that search's shortlist.
 - Voting uses a random browser identifier stored in local storage, not sign-in or verified identity. Votes are one-per-venue per browser profile and can be changed or removed; clearing local storage or using another browser creates another voting identity.
 - Search links do not currently expire automatically. They remain in D1 until records are manually removed, and each new search creates a separate snapshot.
-- The configured D1 ID in `wrangler.json` is a local-development placeholder. Before deploying, run `npx wrangler d1 create christmasdo-db`, replace the placeholder `database_id` with the ID Wrangler returns, then run `npx wrangler d1 migrations apply christmasdo-db --remote`. Cloudflare authentication is required for these remote steps.
+- `wrangler.json` binds `DB` to the `christmasdo-db` database in the EO Creative Cloudflare account. Apply migrations with `npx wrangler d1 migrations apply christmasdo-db --remote` before deploying schema changes; remote operations require Cloudflare authentication. For another account, create a database there and replace `database_id` with its ID.
 
 ## Deploy
 
-Build and deploy to Cloudflare Workers using the configured Wrangler project. Set the Worker secret before relying on search in production:
+Build and deploy to Cloudflare Workers using the configured Wrangler project. The configured custom domain is `christmasdo.app`; update the route when deploying to another domain. Set the Worker secret before relying on search in production:
 
 ```bash
 npm run build

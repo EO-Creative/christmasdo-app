@@ -12,8 +12,15 @@
 		{
 			"binding": "DB",
 			"database_name": "christmasdo-db",
-			"database_id": "00000000-0000-0000-0000-000000000001",
+			"database_id": "d9297e12-82d0-43a9-8267-b375abfc380b",
 			"migrations_dir": "migrations"
+		}
+	],
+	"routes": [
+		{
+			"pattern": "christmasdo.app",
+			"custom_domain": true,
+			"zone_name": "christmasdo.app"
 		}
 	],
 	"assets": {
